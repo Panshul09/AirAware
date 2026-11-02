@@ -120,77 +120,127 @@ HEAT_RGB = np.array(
 st.markdown(
     """
     <style>
-    :root { color-scheme: light !important; }
+    :root, html, body { color-scheme: light !important; }
     html, body, .stApp, [data-testid="stAppViewContainer"] {
-        color-scheme: light !important; background:#F6F8F6 !important;
-        color:#17251D !important; font-family:Inter,"Segoe UI",Arial,sans-serif !important;
+        color-scheme: light !important;
+        background: #F6F8F6 !important;
+        color: #17251D !important;
+        font-family: Inter, "Segoe UI", Arial, sans-serif !important;
     }
-    [data-testid="stHeader"] { background:#F6F8F6 !important; }
-    [data-testid="stSidebar"] { background:#FFFFFF !important; border-right:1px solid #E2E8E2 !important; }
-    [data-testid="stSidebar"] .block-container { padding:1.25rem .95rem 2rem !important; }
-    h1,h2,h3,h4 { color:#17251D !important; letter-spacing:-.025em !important; }
-    p, label, [data-testid="stWidgetLabel"] p { color:#34443A !important; }
-    [data-testid="stCaptionContainer"] { color:#68766D !important; }
+    [data-testid="stHeader"] { background: #F6F8F6 !important; }
+    [data-testid="stSidebar"], [data-testid="stSidebar"] > div:first-child {
+        background: #FFFFFF !important;
+        border-right: 1px solid #E2E8E2 !important;
+    }
+    [data-testid="stSidebar"] .block-container { padding: 1.25rem .95rem 2rem !important; }
+    h1, h2, h3, h4 { color: #17251D !important; letter-spacing: -.025em !important; }
+    p, label, [data-testid="stWidgetLabel"] p { color: #34443A !important; }
+    [data-testid="stCaptionContainer"] { color: #68766D !important; }
 
-    /* Force all Streamlit buttons to a white surface with dark text. */
+    /* Style only real Streamlit action buttons. Do not style every button on
+       the page: BaseWeb uses button-like elements inside select widgets. */
     .stApp [data-testid="stButton"] button,
     .stApp [data-testid="stDownloadButton"] button,
-    .stApp [data-testid="stFormSubmitButton"] button,
-    .stApp button[data-testid^="stBaseButton-"] {
-        appearance:none !important; background:#FFFFFF !important;
-        background-color:#FFFFFF !important; background-image:none !important;
-        color:#111B14 !important; -webkit-text-fill-color:#111B14 !important;
-        border:1px solid #CDD8CE !important; border-radius:10px !important;
-        box-shadow:0 1px 2px rgba(20,35,24,.05) !important;
-        opacity:1 !important; font-weight:650 !important; min-height:40px !important;
+    .stApp [data-testid="stFormSubmitButton"] button {
+        appearance: none !important;
+        background: #FFFFFF !important;
+        background-color: #FFFFFF !important;
+        background-image: none !important;
+        color: #111B14 !important;
+        -webkit-text-fill-color: #111B14 !important;
+        border: 1px solid #CDD8CE !important;
+        border-radius: 10px !important;
+        box-shadow: 0 1px 2px rgba(20,35,24,.05) !important;
+        opacity: 1 !important;
+        font-weight: 650 !important;
+        min-height: 40px !important;
     }
-    .stApp [data-testid="stButton"] button *,
-    .stApp [data-testid="stDownloadButton"] button *,
-    .stApp [data-testid="stFormSubmitButton"] button *,
-    .stApp button[data-testid^="stBaseButton-"] * {
-        color:#111B14 !important; -webkit-text-fill-color:#111B14 !important;
-        fill:#111B14 !important; opacity:1 !important;
+    .stApp [data-testid="stButton"] button p,
+    .stApp [data-testid="stButton"] button span,
+    .stApp [data-testid="stDownloadButton"] button p,
+    .stApp [data-testid="stDownloadButton"] button span,
+    .stApp [data-testid="stFormSubmitButton"] button p,
+    .stApp [data-testid="stFormSubmitButton"] button span {
+        color: #111B14 !important;
+        -webkit-text-fill-color: #111B14 !important;
     }
     .stApp [data-testid="stButton"] button:hover,
     .stApp [data-testid="stDownloadButton"] button:hover,
-    .stApp [data-testid="stFormSubmitButton"] button:hover,
-    .stApp button[data-testid^="stBaseButton-"]:hover {
-        background:#F1F4F1 !important; background-color:#F1F4F1 !important;
-        border-color:#9DAD9F !important; color:#101A13 !important;
-        -webkit-text-fill-color:#101A13 !important;
+    .stApp [data-testid="stFormSubmitButton"] button:hover {
+        background: #F1F4F1 !important;
+        background-color: #F1F4F1 !important;
+        border-color: #9DAD9F !important;
+        color: #101A13 !important;
+        -webkit-text-fill-color: #101A13 !important;
     }
     .stApp [data-testid="stButton"] button:disabled,
-    .stApp button[data-testid^="stBaseButton-"]:disabled {
-        background:#F5F7F5 !important; color:#7B867D !important;
-        -webkit-text-fill-color:#7B867D !important;
+    .stApp [data-testid="stDownloadButton"] button:disabled {
+        background: #F5F7F5 !important;
+        color: #7B867D !important;
+        -webkit-text-fill-color: #7B867D !important;
     }
 
-    /* Native dropdowns and input menus remain white on dark-mode systems. */
-    .stApp [data-baseweb="select"] > div,
-    .stApp [data-baseweb="input"] > div,
-    .stApp [data-baseweb="input"] input {
-        background:#FFFFFF !important; background-color:#FFFFFF !important;
-        color:#17251D !important; -webkit-text-fill-color:#17251D !important;
-        border-color:#D6E0D7 !important; border-radius:10px !important;
-        box-shadow:none !important;
+    /* Light select controls. Keep the inner arrow area transparent and style
+       its icon as a small grey chevron instead of a dark square. */
+    .stApp [data-testid="stSelectbox"] [data-baseweb="select"] > div {
+        background: #FFFFFF !important;
+        background-color: #FFFFFF !important;
+        color: #17251D !important;
+        border-color: #D1DBD2 !important;
+        box-shadow: none !important;
     }
-    .stApp [data-baseweb="select"] *, .stApp [data-baseweb="input"] *,
-    .stApp [data-baseweb="menu"] *, .stApp [data-baseweb="popover"] * {
-        color:#17251D !important; -webkit-text-fill-color:#17251D !important;
+    .stApp [data-testid="stSelectbox"] [data-baseweb="select"] [role="combobox"],
+    .stApp [data-testid="stSelectbox"] [data-baseweb="select"] [role="combobox"] * {
+        color: #17251D !important;
+        -webkit-text-fill-color: #17251D !important;
     }
-    .stApp [data-baseweb="menu"], .stApp [data-baseweb="popover"],
-    .stApp [role="listbox"] { background:#FFFFFF !important; }
-    .stApp [role="option"]:hover, .stApp [role="option"][aria-selected="true"] { background:#EEF3EF !important; }
-    .stApp [data-baseweb="select"] svg { fill:#46554A !important; color:#46554A !important; }
+    .stApp [data-testid="stSelectbox"] [data-baseweb="select"] button {
+        background: transparent !important;
+        background-color: transparent !important;
+        border: 0 !important;
+        box-shadow: none !important;
+        color: #68766D !important;
+        min-height: 0 !important;
+        padding: 0 !important;
+    }
+    .stApp [data-testid="stSelectbox"] [data-baseweb="select"] svg {
+        color: #68766D !important;
+        fill: #68766D !important;
+        stroke: #68766D !important;
+        background: transparent !important;
+    }
+    .stApp [data-testid="stSelectbox"] [data-baseweb="select"] input {
+        color: #17251D !important;
+        -webkit-text-fill-color: #17251D !important;
+        background: transparent !important;
+    }
+    .stApp [data-testid="stSelectbox"] [aria-disabled="true"] {
+        background: #F4F6F4 !important;
+        color: #879188 !important;
+        -webkit-text-fill-color: #879188 !important;
+    }
+    /* The select popup is rendered outside the sidebar DOM, so target it globally. */
+    body div[data-baseweb="popover"],
+    body div[data-baseweb="menu"],
+    body ul[role="listbox"],
+    body div[role="listbox"] {
+        background: #FFFFFF !important;
+        background-color: #FFFFFF !important;
+        color: #17251D !important;
+        border: 1px solid #DCE5DD !important;
+    }
+    body div[data-baseweb="popover"] *,
+    body div[data-baseweb="menu"] *,
+    body [role="listbox"] * {
+        color: #17251D !important;
+        -webkit-text-fill-color: #17251D !important;
+    }
+    body [role="option"]:hover,
+    body [role="option"][aria-selected="true"] {
+        background: #EDF3EE !important;
+        background-color: #EDF3EE !important;
+    }
 
-    /* Quiet grey/white forecast-range radios. */
-    .stApp [data-testid="stRadio"] label, .stApp [data-testid="stRadio"] label * { color:#29372E !important; }
-    .stApp [data-testid="stRadio"] [role="radio"] {
-        background:#FFFFFF !important; border:1.5px solid #A5B0A7 !important; box-shadow:none !important;
-    }
-    .stApp [data-testid="stRadio"] [role="radio"][aria-checked="true"] {
-        background:#E7EDE8 !important; border-color:#7D8B80 !important;
-    }
     [data-testid="stMetric"] { background:#FFFFFF !important; border:1px solid #E2E8E2 !important; border-radius:14px !important; padding:16px 18px !important; }
     [data-testid="stMetricLabel"] { color:#66746A !important; }
     [data-testid="stMetricValue"] { color:#17251D !important; font-weight:740 !important; }
@@ -336,7 +386,6 @@ st.sidebar.markdown(
     '<div class="air-brand-sub">Global environmental intelligence</div>',
     unsafe_allow_html=True,
 )
-st.sidebar.caption("STABILIZED BUILD · v2")
 st.sidebar.markdown("---")
 st.sidebar.markdown("**LOCATION**")
 selected_country_name = st.sidebar.selectbox(
@@ -383,7 +432,6 @@ selected_city_id = st.sidebar.selectbox(
     format_func=lambda value: CITY_PLACEHOLDER if value is None else city_display_by_id.get(value, str(value)),
     key="city_geoname_id",
     disabled=selected_region_name == REGION_PLACEHOLDER or not city_id_options,
-    help="Choose a city from the selected country and region. The map moves to it automatically.",
 )
 
 selected_city_row = None
@@ -418,12 +466,16 @@ else:
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("**FORECAST TRENDS**")
-forecast_window = st.sidebar.radio(
-    "Chart range",
-    ["24 hours", "48 hours", "5 days"],
-    key="forecast_window",
-    label_visibility="collapsed",
-)
+# White range buttons replace the dark native radio indicators.
+forecast_options = [("24h", "24 hours"), ("48h", "48 hours"), ("5d", "5 days")]
+range_columns = st.sidebar.columns(3, gap="small")
+for range_column, (short_label, full_label) in zip(range_columns, forecast_options):
+    button_label = ("✓ " if st.session_state["forecast_window"] == full_label else "") + short_label
+    with range_column:
+        if st.button(button_label, key=f"forecast_range_{short_label}", use_container_width=True):
+            st.session_state["forecast_window"] = full_label
+            st.rerun()
+forecast_window = st.session_state["forecast_window"]
 refresh_requested = st.sidebar.button("Refresh data", use_container_width=True, type="secondary")
 
 
@@ -813,7 +865,7 @@ st.markdown(
     <div class="air-hero">
       <div class="air-eyebrow">Global environmental intelligence</div>
       <div class="air-title">Understand the air around you.</div>
-      <div class="air-subtitle">Explore modelled air-quality forecasts on a continuous geographic heat layer, select a city from its country and region, and compare conditions across major cities worldwide.</div>
+      <div class="air-subtitle">Explore modelled air-quality forecasts on a continuous geographic heat layer, select a city from its country and region, review forecast insights, download hourly data, and compare major cities worldwide.</div>
     </div>
     """,
     unsafe_allow_html=True,
@@ -1018,6 +1070,83 @@ else:
             with right_chart:
                 st.markdown("##### Particulate matter")
                 st.plotly_chart(pm_fig, use_container_width=True, config={"displaylogo": False})
+
+            # ============================================================
+            # DAY 3 FEATURE: FORECAST INSIGHTS + DOWNLOADABLE DATA
+            # ============================================================
+            st.markdown("---")
+            st.markdown('<div class="air-section-label">FORECAST INTELLIGENCE</div>', unsafe_allow_html=True)
+            st.markdown("### Forecast insights")
+            st.caption("A quick summary of the selected forecast window, calculated from the hourly model estimates.")
+
+            valid_forecast = chart_frame.dropna(subset=["us_aqi"]).copy()
+            if valid_forecast.empty:
+                st.info("There are not enough AQI values in this forecast window to calculate summary insights.")
+            else:
+                valid_forecast["aqi_category"] = valid_forecast["us_aqi"].apply(aqi_category)
+                average_aqi = float(valid_forecast["us_aqi"].mean())
+                peak_row = valid_forecast.loc[valid_forecast["us_aqi"].idxmax()]
+                clean_row = valid_forecast.loc[valid_forecast["us_aqi"].idxmin()]
+                hours_above_100 = int((valid_forecast["us_aqi"] > 100).sum())
+                hours_above_150 = int((valid_forecast["us_aqi"] > 150).sum())
+
+                insight_columns = st.columns(4)
+                with insight_columns[0]:
+                    st.metric("Average forecast AQI", format_value(average_aqi, decimals=0))
+                with insight_columns[1]:
+                    st.metric("Peak forecast AQI", format_value(peak_row["us_aqi"], decimals=0))
+                with insight_columns[2]:
+                    st.metric("Hours above AQI 100", str(hours_above_100))
+                with insight_columns[3]:
+                    st.metric("Lowest forecast AQI", format_value(clean_row["us_aqi"], decimals=0))
+
+                st.markdown(
+                    f"<div class='air-info' style='min-height:0;margin:8px 0 14px;'>"
+                    f"<strong>Highest estimate:</strong> {format_value(peak_row['us_aqi'], decimals=0)} US AQI at {html.escape(pd.Timestamp(peak_row['time']).strftime('%d %b, %I:%M %p'))}. "
+                    f"<strong>Lowest estimate:</strong> {format_value(clean_row['us_aqi'], decimals=0)} US AQI at {html.escape(pd.Timestamp(clean_row['time']).strftime('%d %b, %I:%M %p'))}. "
+                    f"There are {hours_above_150} forecast hours above 150 in this selected window."
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+
+                category_order = ["Good", "Moderate", "Unhealthy for sensitive groups", "Unhealthy", "Very unhealthy", "Hazardous"]
+                category_counts = valid_forecast["aqi_category"].value_counts().reindex(category_order, fill_value=0)
+                category_counts = category_counts[category_counts > 0]
+                if not category_counts.empty:
+                    category_fig = go.Figure(go.Bar(
+                        x=category_counts.index.tolist(),
+                        y=category_counts.values.tolist(),
+                        marker_color=[AQI_COLORS[name] for name in category_counts.index],
+                        hovertemplate="%{x}<br>%{y} forecast hours<extra></extra>",
+                    ))
+                    category_fig.update_layout(
+                        title="Forecast hours by US AQI category",
+                        showlegend=False,
+                        yaxis_title="Number of hours",
+                        xaxis_title="",
+                        bargap=0.35,
+                    )
+                    make_chart_layout(category_fig, height=300)
+                    st.plotly_chart(category_fig, use_container_width=True, config={"displaylogo": False})
+
+                export_frame = chart_frame.copy()
+                export_frame["aqi_category"] = export_frame["us_aqi"].apply(aqi_category)
+                export_frame = export_frame.rename(columns={
+                    "time": "local_time",
+                    "us_aqi": "us_aqi_modelled",
+                    "pm2_5": "pm2_5_ug_m3",
+                    "pm10": "pm10_ug_m3",
+                })
+                city_slug = "".join(ch.lower() if ch.isalnum() else "_" for ch in selected_name).strip("_")
+                st.download_button(
+                    "Download forecast data (CSV)",
+                    data=export_frame.to_csv(index=False).encode("utf-8-sig"),
+                    file_name=f"airaware_{city_slug}_{forecast_window.replace(' ', '_')}.csv",
+                    mime="text/csv",
+                    key="download_selected_forecast_csv",
+                    use_container_width=False,
+                )
+                st.caption("The CSV contains the displayed hourly model estimates, local timestamps and AQI category labels. Missing values remain blank rather than being estimated.")
         else:
             st.info("The city was selected, but hourly air-quality forecast data is temporarily unavailable.")
             if hourly_error:
