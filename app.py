@@ -262,6 +262,51 @@ st.markdown(
     .air-info { background:#FFFFFF; border:1px solid #E1E8E1; border-radius:13px; padding:18px; min-height:112px; }
     .air-legend { display:flex; align-items:center; gap:10px; flex-wrap:wrap; font-size:11px; color:#65736A; margin:9px 0 12px; }
     .air-gradient { height:10px; width:220px; border-radius:20px; border:1px solid rgba(0,0,0,.08); background:linear-gradient(90deg,#3052D2,#2278E8,#26BE70,#9BD744,#F5DE41,#F59937,#E44139,#742A90); }
+
+
+    /* Subtle motion: page entrance, cards, charts and controls. */
+    @keyframes airFadeUp {
+        from { opacity: 0; transform: translateY(10px); }
+        to   { opacity: 1; transform: translateY(0); }
+    }
+    @keyframes airSoftFade {
+        from { opacity: 0; }
+        to   { opacity: 1; }
+    }
+    .block-container { animation: airFadeUp .48s cubic-bezier(.2,.7,.2,1) both; }
+    .air-hero { animation: airFadeUp .55s cubic-bezier(.2,.7,.2,1) both; }
+    .air-status, .air-info, .air-selected { animation: airSoftFade .55s ease-out both; }
+    [data-testid="stMetric"] {
+        transition: transform .18s ease, box-shadow .18s ease, border-color .18s ease !important;
+    }
+    [data-testid="stMetric"]:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 7px 18px rgba(24, 43, 29, .07) !important;
+        border-color: #C8D8CA !important;
+    }
+    .stApp [data-testid="stButton"] button,
+    .stApp [data-testid="stDownloadButton"] button,
+    .stApp [data-testid="stFormSubmitButton"] button {
+        transition: background-color .16s ease, border-color .16s ease,
+                    box-shadow .16s ease, transform .16s ease !important;
+    }
+    .stApp [data-testid="stButton"] button:hover,
+    .stApp [data-testid="stDownloadButton"] button:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 4px 10px rgba(24, 43, 29, .07) !important;
+    }
+    .air-selected { transition: border-color .18s ease, box-shadow .18s ease; }
+    .air-selected:hover { border-color: #C8D8CA; box-shadow: 0 4px 12px rgba(24,43,29,.045); }
+    [data-testid="stPlotlyChart"] { animation: airSoftFade .65s ease-out both; }
+    @media (prefers-reduced-motion: reduce) {
+        *, *::before, *::after {
+            animation-duration: .01ms !important;
+            animation-iteration-count: 1 !important;
+            transition-duration: .01ms !important;
+            scroll-behavior: auto !important;
+        }
+    }
+
     </style>
     """,
     unsafe_allow_html=True,
@@ -341,13 +386,13 @@ def geocode_catalog_city(city_name: str, country_name: str, region_name: str, ge
     return max(candidates, key=lambda item: int(item.get("population") or 0))
 
 
-def reset_region_and_city() -> None:
-    st.session_state["region_name"] = REGION_PLACEHOLDER
-    st.session_state["city_geoname_id"] = None
+def reset_region_and_city_day4() -> None:
+    st.session_state["region_name_day4"] = None
+    st.session_state["city_geoname_id_day4"] = None
 
 
-def reset_city_only() -> None:
-    st.session_state["city_geoname_id"] = None
+def reset_city_only_day4() -> None:
+    st.session_state["city_geoname_id_day4"] = None
 
 
 # Load the global city catalog before drawing dependent selectboxes.
@@ -365,22 +410,18 @@ if not country_options:
     st.error("The city directory did not contain any countries.")
     st.stop()
 
-if "country_name" not in st.session_state:
-    st.session_state["country_name"] = "Pakistan" if "Pakistan" in country_options else country_options[0]
-if st.session_state["country_name"] not in country_options:
-    st.session_state["country_name"] = country_options[0]
-
-country_rows = city_catalog[city_catalog["country"] == st.session_state["country_name"]]
-region_options_current = sorted(country_rows["region"].dropna().unique().tolist(), key=str.casefold)
-if st.session_state.get("region_name") not in ([REGION_PLACEHOLDER] + region_options_current):
-    preferred = "Sindh" if st.session_state["country_name"] == "Pakistan" and "Sindh" in region_options_current else REGION_PLACEHOLDER
-    st.session_state["region_name"] = preferred
-if "city_geoname_id" not in st.session_state:
-    st.session_state["city_geoname_id"] = None
+# New state keys intentionally prevent a previous session's Pakistan/Hyderabad
+# selection from carrying over. The initial experience opens on the world map.
+if "country_name_day4" not in st.session_state or st.session_state["country_name_day4"] not in country_options:
+    st.session_state["country_name_day4"] = None
+if "region_name_day4" not in st.session_state:
+    st.session_state["region_name_day4"] = None
+if "city_geoname_id_day4" not in st.session_state:
+    st.session_state["city_geoname_id_day4"] = None
 if "forecast_window" not in st.session_state:
     st.session_state["forecast_window"] = "48 hours"
 
-# Clean, compact sidebar: only the three location selectors and forecast range.
+# Clean, compact sidebar: three dependent selectors and forecast range.
 st.sidebar.markdown(
     '<div class="air-brand">🌍 AirAware</div>'
     '<div class="air-brand-sub">Global environmental intelligence</div>',
@@ -388,50 +429,59 @@ st.sidebar.markdown(
 )
 st.sidebar.markdown("---")
 st.sidebar.markdown("**LOCATION**")
+
 selected_country_name = st.sidebar.selectbox(
     "Country",
-    country_options,
-    key="country_name",
-    on_change=reset_region_and_city,
-)
-country_rows = city_catalog[city_catalog["country"] == selected_country_name]
-region_options_current = sorted(country_rows["region"].dropna().unique().tolist(), key=str.casefold)
-region_widget_options = [REGION_PLACEHOLDER] + region_options_current
-if st.session_state.get("region_name") not in region_widget_options:
-    st.session_state["region_name"] = REGION_PLACEHOLDER
-selected_region_name = st.sidebar.selectbox(
-    "State / province / region",
-    region_widget_options,
-    key="region_name",
-    on_change=reset_city_only,
-    disabled=len(region_options_current) == 0,
+    options=[None] + country_options,
+    format_func=lambda value: "Select a country" if value is None else str(value),
+    key="country_name_day4",
+    on_change=reset_region_and_city_day4,
 )
 
-if selected_region_name == REGION_PLACEHOLDER:
+if selected_country_name is None:
+    country_rows = city_catalog.iloc[0:0].copy()
+    region_options_current: list[str] = []
+else:
+    country_rows = city_catalog[city_catalog["country"] == selected_country_name]
+    region_options_current = sorted(country_rows["region"].dropna().unique().tolist(), key=str.casefold)
+
+region_widget_options: list[str | None] = [None] + region_options_current
+if st.session_state.get("region_name_day4") not in region_widget_options:
+    st.session_state["region_name_day4"] = None
+
+selected_region_name = st.sidebar.selectbox(
+    "State / province / region",
+    options=region_widget_options,
+    format_func=lambda value: "Select a state / region" if value is None else str(value),
+    key="region_name_day4",
+    on_change=reset_city_only_day4,
+    disabled=selected_country_name is None or not region_options_current,
+)
+
+if selected_region_name is None:
     region_city_rows = country_rows.iloc[0:0].copy()
 else:
     region_city_rows = country_rows[country_rows["region"] == selected_region_name].copy()
 
 region_city_rows = region_city_rows.sort_values("name", key=lambda col: col.str.casefold(), kind="stable")
-# The widget stores GeoNames IDs, so two cities with identical names remain distinct.
 city_id_options = [int(value) for value in region_city_rows["geonameid"].tolist()]
 city_display_by_id: dict[int, str] = {}
 name_counts = region_city_rows["name"].value_counts().to_dict()
 for _, row in region_city_rows.iterrows():
-    name = str(row["name"])
+    city_name = str(row["name"])
     city_display_by_id[int(row["geonameid"])] = (
-        f"{name} · place {int(row['geonameid'])}" if name_counts.get(name, 0) > 1 else name
+        f"{city_name} · place {int(row['geonameid'])}" if name_counts.get(city_name, 0) > 1 else city_name
     )
 
-if st.session_state.get("city_geoname_id") not in city_id_options:
-    st.session_state["city_geoname_id"] = None
+if st.session_state.get("city_geoname_id_day4") not in [None] + city_id_options:
+    st.session_state["city_geoname_id_day4"] = None
 
 selected_city_id = st.sidebar.selectbox(
     "City",
     options=[None] + city_id_options,
     format_func=lambda value: CITY_PLACEHOLDER if value is None else city_display_by_id.get(value, str(value)),
-    key="city_geoname_id",
-    disabled=selected_region_name == REGION_PLACEHOLDER or not city_id_options,
+    key="city_geoname_id_day4",
+    disabled=selected_region_name is None or not city_id_options,
 )
 
 selected_city_row = None
@@ -451,22 +501,24 @@ if selected_city_id is not None:
             selected_place = None
 
 if selected_city_row is not None:
+    region_label = str(selected_city_row["region"])
+    if region_label == NO_REGION:
+        region_label = "Region not listed"
     st.sidebar.markdown(
         '<div class="air-selected">'
         '<div style="font-size:9px;letter-spacing:1.35px;color:#7A887E;font-weight:750;">SELECTED LOCATION</div>'
         f'<div style="font-size:15px;font-weight:750;color:#17251D;margin-top:4px;">{html.escape(str(selected_city_row["name"]))}</div>'
-        f'<div style="font-size:11px;color:#68766D;margin-top:2px;">{html.escape(str(selected_city_row["region"]))}, {html.escape(str(selected_city_row["country"]))}</div>'
+        f'<div style="font-size:11px;color:#68766D;margin-top:2px;">{html.escape(region_label)}, {html.escape(str(selected_city_row["country"]))}</div>'
         '</div>',
         unsafe_allow_html=True,
     )
     if selected_place is None:
         st.sidebar.caption("The city was selected, but its map coordinates could not be resolved. Check your connection.")
 else:
-    st.sidebar.caption("Choose a city to zoom into its local air-quality heatmap. With no city selected, the world view is shown.")
+    st.sidebar.caption("Choose a country, region and city to open a local heatmap. With no location selected, AirAware opens on the world view.")
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("**FORECAST TRENDS**")
-# White range buttons replace the dark native radio indicators.
 forecast_options = [("24h", "24 hours"), ("48h", "48 hours"), ("5d", "5 days")]
 range_columns = st.sidebar.columns(3, gap="small")
 for range_column, (short_label, full_label) in zip(range_columns, forecast_options):
@@ -537,6 +589,29 @@ def fetch_hourly_air(latitude: float, longitude: float, timezone_name: str) -> p
     frame["time"] = pd.to_datetime(frame["time"], errors="coerce")
     frame = frame.dropna(subset=["time"]).reset_index(drop=True)
     for column in ("us_aqi", "pm2_5", "pm10"):
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    return frame
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_hourly_weather(latitude: float, longitude: float, timezone_name: str) -> pd.DataFrame:
+    """Fetch matching hourly weather forecasts for the relationship explorer."""
+    params = {
+        "latitude": float(latitude),
+        "longitude": float(longitude),
+        "hourly": "temperature_2m,relative_humidity_2m,wind_speed_10m,precipitation",
+        "forecast_days": 5,
+        "timezone": timezone_name or TIMEZONE_DEFAULT,
+    }
+    response = requests.get(WEATHER_URL, params=params, timeout=30)
+    response.raise_for_status()
+    payload = response.json()
+    if "hourly" not in payload or "time" not in payload["hourly"]:
+        raise ValueError("Unexpected hourly weather response.")
+    frame = pd.DataFrame(payload["hourly"])
+    frame["time"] = pd.to_datetime(frame["time"], errors="coerce")
+    frame = frame.dropna(subset=["time"]).reset_index(drop=True)
+    for column in ("temperature_2m", "relative_humidity_2m", "wind_speed_10m", "precipitation"):
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
     return frame
 
@@ -852,6 +927,7 @@ def render_comparison_table(frame: pd.DataFrame) -> None:
 if refresh_requested:
     fetch_current_batch.clear()
     fetch_hourly_air.clear()
+    fetch_hourly_weather.clear()
     fetch_weather.clear()
     st.rerun()
 
@@ -973,8 +1049,10 @@ else:
 
         selected_timezone = str(selected_place.get("timezone") or TIMEZONE_DEFAULT)
         selected_hourly = pd.DataFrame()
+        selected_hourly_weather = pd.DataFrame()
         selected_weather: dict = {}
         hourly_error = None
+        hourly_weather_error = None
         weather_error = None
         try:
             selected_hourly = fetch_hourly_air(
@@ -992,6 +1070,14 @@ else:
             )
         except (requests.RequestException, ValueError, KeyError) as exc:
             weather_error = str(exc)
+        try:
+            selected_hourly_weather = fetch_hourly_weather(
+                float(selected_place["latitude"]),
+                float(selected_place["longitude"]),
+                selected_timezone,
+            )
+        except (requests.RequestException, ValueError, KeyError) as exc:
+            hourly_weather_error = str(exc)
 
         if not selected_hourly.empty:
             local_now = pd.Timestamp.now(tz=selected_timezone).tz_localize(None)
@@ -1147,17 +1233,158 @@ else:
                     use_container_width=False,
                 )
                 st.caption("The CSV contains the displayed hourly model estimates, local timestamps and AQI category labels. Missing values remain blank rather than being estimated.")
+            # ============================================================
+            # DAY 4 FEATURE: WEATHER & POLLUTION RELATIONSHIP EXPLORER
+            # These are forecast-to-forecast associations, not causal claims.
+            # ============================================================
+            st.markdown("---")
+            st.markdown('<div class="air-section-label">ENVIRONMENTAL RELATIONSHIPS</div>', unsafe_allow_html=True)
+            st.markdown("### Weather & pollution explorer")
+            st.caption(
+                "Explore whether changes in the weather forecast move alongside changes in the air-quality forecast. "
+                "This is an exploratory association analysis, not proof that weather caused a pollution change."
+            )
+
+            if selected_hourly_weather.empty:
+                st.info("Hourly weather data is unavailable for this city right now, so the relationship explorer cannot be calculated.")
+                if hourly_weather_error:
+                    with st.expander("Weather data details"):
+                        st.code(hourly_weather_error)
+            else:
+                relationship_data = selected_hourly.merge(
+                    selected_hourly_weather,
+                    on="time",
+                    how="inner",
+                    validate="one_to_one",
+                )
+                relationship_data = relationship_data[
+                    relationship_data["time"] >= local_now.floor("h")
+                ].head(hours).copy()
+
+                pollutant_columns = ["us_aqi", "pm2_5", "pm10"]
+                weather_columns = ["temperature_2m", "relative_humidity_2m", "wind_speed_10m", "precipitation"]
+                relationship_data = relationship_data.dropna(subset=pollutant_columns + weather_columns, how="all")
+
+                if len(relationship_data) < 12:
+                    st.info("At least 12 matching hourly weather and air-quality forecast rows are needed for a useful comparison. More data may become available after refreshing.")
+                else:
+                    # Spearman's rank correlation: rank the values, then use
+                    # pandas' built-in Pearson correlation on the ranks.
+                    corr_matrix = pd.DataFrame(index=weather_columns, columns=pollutant_columns, dtype=float)
+                    for weather_column in weather_columns:
+                        for pollutant_column in pollutant_columns:
+                            pair = relationship_data[[weather_column, pollutant_column]].dropna()
+                            if len(pair) >= 12 and pair[weather_column].nunique() > 1 and pair[pollutant_column].nunique() > 1:
+                                corr_matrix.loc[weather_column, pollutant_column] = pair[weather_column].rank().corr(pair[pollutant_column].rank())
+
+                    def correlation_text(value: float | None) -> str:
+                        if value is None or pd.isna(value):
+                            return "Not enough variation"
+                        magnitude = abs(float(value))
+                        if magnitude < 0.20:
+                            strength = "Very weak"
+                        elif magnitude < 0.40:
+                            strength = "Weak"
+                        elif magnitude < 0.60:
+                            strength = "Moderate"
+                        elif magnitude < 0.80:
+                            strength = "Strong"
+                        else:
+                            strength = "Very strong"
+                        direction = "positive" if value > 0 else "negative"
+                        return f"{strength} {direction} association"
+
+                    primary_pairs = [
+                        ("wind_speed_10m", "AQI vs wind", "Wind speed", "us_aqi"),
+                        ("relative_humidity_2m", "AQI vs humidity", "Relative humidity", "us_aqi"),
+                        ("temperature_2m", "AQI vs temperature", "Temperature", "us_aqi"),
+                    ]
+                    correlation_cols = st.columns(3)
+                    for col, (weather_col, label, _, pollutant_col) in zip(correlation_cols, primary_pairs):
+                        value = corr_matrix.loc[weather_col, pollutant_col]
+                        with col:
+                            st.metric(label, "—" if pd.isna(value) else f"{value:+.2f}")
+                            st.caption(correlation_text(value))
+
+                    weather_names = {
+                        "temperature_2m": "Temperature",
+                        "relative_humidity_2m": "Humidity",
+                        "wind_speed_10m": "Wind speed",
+                        "precipitation": "Precipitation",
+                    }
+                    pollutant_names = {
+                        "us_aqi": "US AQI",
+                        "pm2_5": "PM2.5",
+                        "pm10": "PM10",
+                    }
+                    heatmap_values = corr_matrix.to_numpy(dtype=float)
+                    heatmap_text = np.empty(heatmap_values.shape, dtype=object)
+                    for row_index in range(heatmap_values.shape[0]):
+                        for col_index in range(heatmap_values.shape[1]):
+                            value = heatmap_values[row_index, col_index]
+                            heatmap_text[row_index, col_index] = "—" if np.isnan(value) else f"{value:+.2f}"
+
+                    relationship_fig = go.Figure(go.Heatmap(
+                        z=heatmap_values,
+                        x=[pollutant_names[column] for column in pollutant_columns],
+                        y=[weather_names[column] for column in weather_columns],
+                        text=heatmap_text,
+                        texttemplate="%{text}",
+                        textfont={"color": "#17251D", "size": 12},
+                        zmin=-1,
+                        zmax=1,
+                        zmid=0,
+                        colorscale=[
+                            [0.0, "#D96B63"],
+                            [0.5, "#F3F5F2"],
+                            [1.0, "#39865D"],
+                        ],
+                        colorbar={
+                            "title": {"text": "Spearman r", "font": {"color": "#17251D"}},
+                            "tickfont": {"color": "#17251D"},
+                        },
+                        hovertemplate="%{y} vs %{x}<br>Spearman r: %{z:.2f}<extra></extra>",
+                    ))
+                    relationship_fig.update_layout(
+                        title="Weather–pollutant rank correlations",
+                        xaxis_title="Air-quality variable",
+                        yaxis_title="Weather variable",
+                    )
+                    make_chart_layout(relationship_fig, height=330)
+                    st.plotly_chart(relationship_fig, use_container_width=True, config={"displaylogo": False})
+
+                    scatter_candidates = relationship_data[["wind_speed_10m", "us_aqi"]].dropna()
+                    if len(scatter_candidates) >= 3:
+                        scatter_fig = go.Figure(go.Scatter(
+                            x=scatter_candidates["wind_speed_10m"],
+                            y=scatter_candidates["us_aqi"],
+                            mode="markers",
+                            marker={"color": "#28734A", "size": 8, "opacity": 0.72, "line": {"color": "#FFFFFF", "width": 1}},
+                            name="Hourly forecasts",
+                            hovertemplate="Wind: %{x:.1f} km/h<br>US AQI: %{y:.0f}<extra></extra>",
+                        ))
+                        scatter_fig.update_layout(
+                            title="Wind speed and modelled AQI",
+                            xaxis_title="Wind speed (km/h)",
+                            yaxis_title="US AQI",
+                            showlegend=False,
+                        )
+                        make_chart_layout(scatter_fig, height=300)
+                        st.plotly_chart(scatter_fig, use_container_width=True, config={"displaylogo": False})
+
+                    st.caption(
+                        f"Analysis uses {len(relationship_data)} matching hourly forecast rows. "
+                        "Spearman r describes how two variables move together in this forecast window; "
+                        "it does not establish causation and should not be generalized beyond this city and period."
+                    )
+
         else:
             st.info("The city was selected, but hourly air-quality forecast data is temporarily unavailable.")
             if hourly_error:
                 with st.expander("Technical details"):
                     st.code(hourly_error)
         if weather_error:
-            st.caption("Weather data is temporarily unavailable for this location.")
-
-# ============================================================
-# GLOBAL MAJOR-CITY COMPARISON
-# ============================================================
+            st.caption("Current weather data is temporarily unavailable for this location.")
 
 st.markdown("---")
 st.markdown('<div class="air-section-label">WORLD CITY COMPARISON</div>', unsafe_allow_html=True)
