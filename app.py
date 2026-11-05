@@ -418,9 +418,6 @@ if "region_name_day4" not in st.session_state:
     st.session_state["region_name_day4"] = None
 if "city_geoname_id_day4" not in st.session_state:
     st.session_state["city_geoname_id_day4"] = None
-if "forecast_mode_day4" not in st.session_state:
-    st.session_state["forecast_mode_day4"] = "Hourly"
-
 # Clean, compact sidebar: three dependent selectors and forecast range.
 st.sidebar.markdown(
     '<div class="air-brand">🌍 AirAware</div>'
@@ -521,17 +518,7 @@ else:
     st.sidebar.caption("Choose a country, region and city to open a local heatmap. With no location selected, AirAware opens on the world view.")
 
 st.sidebar.markdown("---")
-st.sidebar.markdown("**FORECAST VIEW**")
-forecast_mode = st.sidebar.selectbox(
-    "Forecast frequency",
-    options=["Hourly", "Daily"],
-    index=0,
-    key="forecast_mode_day4",
-    help="Hourly shows the next 48 hours. Daily summarizes the next five forecast dates.",
-)
-st.sidebar.caption(
-    "Hourly: next 48 hours · Daily: five-day summary"
-)
+st.sidebar.caption("Hourly and daily forecasts are both available on the main page.")
 refresh_requested = st.sidebar.button("Refresh data", use_container_width=True, type="secondary")
 
 
@@ -992,7 +979,7 @@ st.markdown(
     <div class="air-hero">
       <div class="air-eyebrow">Global environmental intelligence</div>
       <div class="air-title">Understand the air around you.</div>
-      <div class="air-subtitle">Explore modelled air-quality forecasts on a continuous geographic heat layer, select a city from its country and region, switch between hourly and daily outlooks, review forecast insights, download data, and compare major cities worldwide.</div>
+      <div class="air-subtitle">Explore modelled air-quality forecasts on a continuous geographic heat layer, select a city from its country and region, review hourly and daily outlooks together, explore forecast insights, download data, and compare major cities worldwide.</div>
     </div>
     """,
     unsafe_allow_html=True,
@@ -1167,264 +1154,331 @@ else:
             with weather_cols[2]:
                 st.metric("Feels-like temperature", format_value(selected_weather.get("apparent_temperature"), " °C"))
 
-            st.markdown("### Forecast trends")
+            st.markdown("### Forecasts")
             future = selected_hourly[selected_hourly["time"] >= local_now.floor("h")].copy()
             if future.empty:
                 future = selected_hourly.copy()
 
-            if forecast_mode == "Hourly":
-                chart_frame = future.head(48).copy()
-                st.caption("Hourly model estimates for the next 48 hours in the selected location's local time.")
+            # ------------------------------------------------------------
+            # DAY 5: DATA AVAILABILITY / QUALITY CHECK
+            # ------------------------------------------------------------
+            st.markdown('<div class="air-section-label">FORECAST DATA QUALITY</div>', unsafe_allow_html=True)
+            st.markdown("#### Data availability")
+            expected_rows = int(len(future))
+            aqi_available = int(future["us_aqi"].notna().sum()) if expected_rows else 0
+            pm25_available = int(future["pm2_5"].notna().sum()) if expected_rows else 0
+            pm10_available = int(future["pm10"].notna().sum()) if expected_rows else 0
+            aqi_coverage = (aqi_available / expected_rows * 100.0) if expected_rows else 0.0
+            pm25_coverage = (pm25_available / expected_rows * 100.0) if expected_rows else 0.0
+            pm10_coverage = (pm10_available / expected_rows * 100.0) if expected_rows else 0.0
 
-                aqi_fig = go.Figure()
-                aqi_fig.add_trace(go.Scatter(
-                    x=chart_frame["time"], y=chart_frame["us_aqi"], mode="lines",
-                    line={"color": "#28734A", "width": 2.7},
-                    fill="tozeroy", fillcolor="rgba(40,115,74,.08)",
-                    connectgaps=False, name="US AQI",
-                    hovertemplate="%{x|%d %b, %H:%M}<br>US AQI: %{y:.0f}<extra></extra>",
-                ))
-                aqi_fig.update_layout(showlegend=False)
-                aqi_fig.update_yaxes(title_text="US AQI")
-                make_chart_layout(aqi_fig)
+            quality_cols = st.columns(4)
+            with quality_cols[0]:
+                st.metric("Forecast timestamps", f"{expected_rows}")
+            with quality_cols[1]:
+                st.metric("AQI data coverage", f"{aqi_coverage:.0f}%")
+            with quality_cols[2]:
+                st.metric("PM2.5 data coverage", f"{pm25_coverage:.0f}%")
+            with quality_cols[3]:
+                st.metric("PM10 data coverage", f"{pm10_coverage:.0f}%")
 
-                pm_fig = go.Figure()
-                pm_fig.add_trace(go.Scatter(
-                    x=chart_frame["time"], y=chart_frame["pm2_5"], mode="lines", name="PM2.5",
-                    line={"color": "#28734A", "width": 2.5}, connectgaps=False,
-                ))
-                pm_fig.add_trace(go.Scatter(
-                    x=chart_frame["time"], y=chart_frame["pm10"], mode="lines", name="PM10",
-                    line={"color": "#6498C9", "width": 2.5}, connectgaps=False,
-                ))
-                pm_fig.update_layout(legend={"orientation": "h", "y": 1.08, "x": 0})
-                pm_fig.update_yaxes(title_text="Concentration (µg/m³)")
-                make_chart_layout(pm_fig)
+            st.progress(min(max(aqi_coverage / 100.0, 0.0), 1.0))
+            st.caption(
+                "Coverage is the share of timestamps returned by the API that contain a non-missing value. "
+                "It is not a guarantee of measurement accuracy; the values are atmospheric-model forecasts."
+            )
+            if aqi_coverage < 80 and expected_rows:
+                st.warning("A noticeable share of AQI values is missing. Interpret the forecast charts with extra caution.")
 
-                insight_frame = chart_frame.dropna(subset=["us_aqi"]).copy()
-                metric_labels = (
-                    "Average forecast AQI", "Peak forecast AQI",
-                    "Hours above AQI 100", "Lowest forecast AQI",
-                )
-                if not insight_frame.empty:
-                    insight_frame["aqi_category"] = insight_frame["us_aqi"].apply(aqi_category)
-                    insight_frame["unit_count"] = 1
-
-            else:
-                chart_frame = aggregate_daily_forecast(future, today=local_now.date())
-                st.caption(
-                    "Daily values are calculated from the available hourly model estimates. "
-                    "Today may be a partial day because earlier hours are excluded."
-                )
-
-                aqi_fig = go.Figure()
-                aqi_fig.add_trace(go.Scatter(
-                    x=chart_frame["day_label"], y=chart_frame["mean_us_aqi"],
-                    mode="lines+markers", name="Daily mean AQI",
-                    line={"color": "#28734A", "width": 3}, marker={"size": 9},
-                    connectgaps=False,
-                    hovertemplate="%{x}<br>Daily mean AQI: %{y:.0f}<extra></extra>",
-                ))
-                aqi_fig.add_trace(go.Scatter(
-                    x=chart_frame["day_label"], y=chart_frame["max_us_aqi"],
-                    mode="lines+markers", name="Daily maximum",
-                    line={"color": "#D97735", "width": 1.7, "dash": "dot"},
-                    marker={"size": 6}, connectgaps=False,
-                    hovertemplate="%{x}<br>Daily maximum AQI: %{y:.0f}<extra></extra>",
-                ))
-                aqi_fig.add_trace(go.Scatter(
-                    x=chart_frame["day_label"], y=chart_frame["min_us_aqi"],
-                    mode="lines+markers", name="Daily minimum",
-                    line={"color": "#6498C9", "width": 1.7, "dash": "dot"},
-                    marker={"size": 6}, connectgaps=False,
-                    hovertemplate="%{x}<br>Daily minimum AQI: %{y:.0f}<extra></extra>",
-                ))
-                aqi_fig.update_layout(yaxis_title="US AQI", legend={"orientation": "h", "y": 1.12, "x": 0})
-                aqi_fig.update_xaxes(tickangle=0)
-                make_chart_layout(aqi_fig, height=350)
-
-                pm_fig = go.Figure()
-                pm_fig.add_trace(go.Bar(
-                    x=chart_frame["day_label"], y=chart_frame["mean_pm2_5"],
-                    name="Daily mean PM2.5", marker_color="#28734A",
-                    hovertemplate="%{x}<br>Mean PM2.5: %{y:.1f} µg/m³<extra></extra>",
-                ))
-                pm_fig.add_trace(go.Bar(
-                    x=chart_frame["day_label"], y=chart_frame["mean_pm10"],
-                    name="Daily mean PM10", marker_color="#6498C9",
-                    hovertemplate="%{x}<br>Mean PM10: %{y:.1f} µg/m³<extra></extra>",
-                ))
-                pm_fig.update_layout(
-                    barmode="group", yaxis_title="Daily mean concentration (µg/m³)",
-                    legend={"orientation": "h", "y": 1.12, "x": 0},
-                )
-                make_chart_layout(pm_fig, height=350)
-
-                insight_frame = chart_frame.dropna(subset=["mean_us_aqi"]).copy()
-                insight_frame = insight_frame.rename(columns={"mean_us_aqi": "us_aqi"})
-                if not insight_frame.empty:
-                    insight_frame["aqi_category"] = insight_frame["us_aqi"].apply(aqi_category)
-                    insight_frame["unit_count"] = 1
-                metric_labels = (
-                    "Average daily AQI", "Highest daily mean AQI",
-                    "Days above AQI 100", "Lowest daily mean AQI",
-                )
-
-            left_chart, right_chart = st.columns(2, gap="large")
-            with left_chart:
-                st.markdown("##### US AQI trend")
-                st.plotly_chart(aqi_fig, use_container_width=True, config={"displaylogo": False})
-            with right_chart:
-                st.markdown("##### Particulate matter")
-                st.plotly_chart(pm_fig, use_container_width=True, config={"displaylogo": False})
-
-            # ============================================================
-            # FORECAST INSIGHTS + DOWNLOADABLE DATA
-            # Metrics and category counts adapt to hourly or daily view.
-            # ============================================================
+            # ------------------------------------------------------------
+            # HOURLY FORECAST — ALWAYS SHOWN ON THE MAIN PAGE
+            # ------------------------------------------------------------
             st.markdown("---")
-            st.markdown('<div class="air-section-label">FORECAST INTELLIGENCE</div>', unsafe_allow_html=True)
-            st.markdown("### Forecast insights")
+            st.markdown('<div class="air-section-label">HOURLY FORECAST</div>', unsafe_allow_html=True)
+            st.markdown("### Next 48 hours")
+            hourly_frame = future.head(48).copy()
+            st.caption(
+                "Hourly model estimates in the selected city's local time. "
+                "Hover over a chart to inspect individual forecast timestamps."
+            )
 
-            if insight_frame.empty:
-                st.info("There are not enough AQI values in this forecast view to calculate summary insights.")
+            if hourly_frame.empty:
+                st.info("Hourly forecast data is not available for this location right now.")
             else:
-                average_aqi = float(insight_frame["us_aqi"].mean())
-                peak_row = insight_frame.loc[insight_frame["us_aqi"].idxmax()]
-                clean_row = insight_frame.loc[insight_frame["us_aqi"].idxmin()]
-                threshold_count = int((insight_frame["us_aqi"] > 100).sum())
-                higher_threshold_count = int((insight_frame["us_aqi"] > 150).sum())
+                hourly_left, hourly_right = st.columns(2, gap="large")
+                with hourly_left:
+                    st.markdown("##### US AQI trend")
+                    hourly_aqi_fig = go.Figure()
+                    hourly_aqi_fig.add_trace(go.Scatter(
+                        x=hourly_frame["time"], y=hourly_frame["us_aqi"], mode="lines",
+                        line={"color": "#28734A", "width": 2.7},
+                        fill="tozeroy", fillcolor="rgba(40,115,74,.08)",
+                        connectgaps=False, name="US AQI",
+                        hovertemplate="%{x|%d %b, %H:%M}<br>US AQI: %{y:.0f}<extra></extra>",
+                    ))
+                    hourly_aqi_fig.update_layout(showlegend=False)
+                    hourly_aqi_fig.update_yaxes(title_text="US AQI")
+                    make_chart_layout(hourly_aqi_fig, height=330)
+                    st.plotly_chart(hourly_aqi_fig, use_container_width=True, config={"displaylogo": False})
 
-                insight_columns = st.columns(4)
-                for col, label, value in zip(
-                    insight_columns,
-                    metric_labels,
-                    [
-                        format_value(average_aqi, decimals=0),
-                        format_value(peak_row["us_aqi"], decimals=0),
-                        str(threshold_count),
-                        format_value(clean_row["us_aqi"], decimals=0),
-                    ],
-                ):
+                with hourly_right:
+                    st.markdown("##### Particulate matter")
+                    hourly_pm_fig = go.Figure()
+                    hourly_pm_fig.add_trace(go.Scatter(
+                        x=hourly_frame["time"], y=hourly_frame["pm2_5"], mode="lines", name="PM2.5",
+                        line={"color": "#28734A", "width": 2.5}, connectgaps=False,
+                    ))
+                    hourly_pm_fig.add_trace(go.Scatter(
+                        x=hourly_frame["time"], y=hourly_frame["pm10"], mode="lines", name="PM10",
+                        line={"color": "#6498C9", "width": 2.5}, connectgaps=False,
+                    ))
+                    hourly_pm_fig.update_layout(legend={"orientation": "h", "y": 1.08, "x": 0})
+                    hourly_pm_fig.update_yaxes(title_text="Concentration (µg/m³)")
+                    make_chart_layout(hourly_pm_fig, height=330)
+                    st.plotly_chart(hourly_pm_fig, use_container_width=True, config={"displaylogo": False})
+
+                hourly_insights = hourly_frame.dropna(subset=["us_aqi"]).copy()
+                if hourly_insights.empty:
+                    st.info("AQI values are missing for the selected hourly forecast window.")
+                else:
+                    hourly_insights["aqi_category"] = hourly_insights["us_aqi"].apply(aqi_category)
+                    hourly_metrics = st.columns(4)
+                    hourly_metric_values = [
+                        ("Average forecast AQI", format_value(hourly_insights["us_aqi"].mean(), decimals=0)),
+                        ("Peak forecast AQI", format_value(hourly_insights["us_aqi"].max(), decimals=0)),
+                        ("Hours above AQI 100", str(int((hourly_insights["us_aqi"] > 100).sum()))),
+                        ("Lowest forecast AQI", format_value(hourly_insights["us_aqi"].min(), decimals=0)),
+                    ]
+                    for col, (label, value) in zip(hourly_metrics, hourly_metric_values):
+                        with col:
+                            st.metric(label, value)
+
+                    # Best six-consecutive-reading window is shown only when
+                    # timestamps are truly hourly and contiguous.
+                    contiguous_hourly = (
+                        len(hourly_insights) >= 6
+                        and hourly_insights["time"].sort_values().diff().dropna().eq(pd.Timedelta(hours=1)).all()
+                    )
+                    if contiguous_hourly:
+                        ordered_hourly = hourly_insights.sort_values("time").set_index("time")
+                        six_reading_average = ordered_hourly["us_aqi"].rolling(window=6, min_periods=6).mean().dropna()
+                        if not six_reading_average.empty:
+                            best_end = six_reading_average.idxmin()
+                            best_start = best_end - pd.Timedelta(hours=5)
+                            best_value = float(six_reading_average.min())
+                            st.markdown(
+                                f"<div class='air-info' style='min-height:0;margin:10px 0;'>"
+                                f"<strong>Lowest six-consecutive-reading average:</strong> {best_value:.0f} US AQI, "
+                                f"from {html.escape(best_start.strftime('%d %b, %I:%M %p'))} "
+                                f"to {html.escape(best_end.strftime('%d %b, %I:%M %p'))}. "
+                                "This is a comparison within the model forecast, not a guarantee of future conditions."
+                                f"</div>",
+                                unsafe_allow_html=True,
+                            )
+                    else:
+                        st.caption("A six-hour window summary is shown only when at least six consecutive hourly AQI readings are available.")
+
+                    hourly_category_counts = hourly_insights["aqi_category"].value_counts()
+                    category_order = [
+                        "Good", "Moderate", "Unhealthy for sensitive groups",
+                        "Unhealthy", "Very unhealthy", "Hazardous",
+                    ]
+                    hourly_category_counts = hourly_category_counts.reindex(category_order, fill_value=0)
+                    hourly_category_counts = hourly_category_counts[hourly_category_counts > 0]
+                    if not hourly_category_counts.empty:
+                        hourly_category_fig = go.Figure(go.Bar(
+                            x=hourly_category_counts.index.tolist(),
+                            y=hourly_category_counts.values.tolist(),
+                            marker_color=[AQI_COLORS[name] for name in hourly_category_counts.index],
+                            hovertemplate="%{x}<br>%{y} forecast hours<extra></extra>",
+                        ))
+                        hourly_category_fig.update_layout(
+                            title="Hourly forecast by US AQI category",
+                            showlegend=False, yaxis_title="Number of hours", xaxis_title="", bargap=0.35,
+                        )
+                        make_chart_layout(hourly_category_fig, height=285)
+                        st.plotly_chart(hourly_category_fig, use_container_width=True, config={"displaylogo": False})
+
+                hourly_export = hourly_frame.copy()
+                hourly_export["aqi_category"] = hourly_export["us_aqi"].apply(aqi_category)
+                hourly_export = hourly_export.rename(columns={
+                    "time": "local_time",
+                    "us_aqi": "us_aqi_modelled",
+                    "pm2_5": "pm2_5_ug_m3",
+                    "pm10": "pm10_ug_m3",
+                })
+                city_slug = "".join(ch.lower() if ch.isalnum() else "_" for ch in selected_name).strip("_")
+                st.download_button(
+                    "Download hourly forecast (CSV)",
+                    data=hourly_export.to_csv(index=False).encode("utf-8-sig"),
+                    file_name=f"airaware_{city_slug}_hourly_forecast.csv",
+                    mime="text/csv",
+                    key="download_hourly_forecast_day5",
+                    use_container_width=False,
+                )
+
+            # ------------------------------------------------------------
+            # DAILY FORECAST — ALSO SHOWN ON THE MAIN PAGE
+            # ------------------------------------------------------------
+            st.markdown("---")
+            st.markdown('<div class="air-section-label">DAILY FORECAST</div>', unsafe_allow_html=True)
+            st.markdown("### Next 5 days")
+            daily_frame = aggregate_daily_forecast(future, today=local_now.date())
+            st.caption(
+                "Daily statistics are aggregated from the hourly model forecasts. "
+                "The first day may be partial because earlier hours are not included."
+            )
+
+            if daily_frame.empty or daily_frame["mean_us_aqi"].notna().sum() == 0:
+                st.info("Daily forecast data is not available for this location right now.")
+            else:
+                daily_left, daily_right = st.columns(2, gap="large")
+                with daily_left:
+                    st.markdown("##### Daily AQI range")
+                    daily_aqi_fig = go.Figure()
+                    daily_aqi_fig.add_trace(go.Scatter(
+                        x=daily_frame["day_label"], y=daily_frame["max_us_aqi"],
+                        mode="lines+markers", name="Daily maximum",
+                        line={"color": "#D97735", "width": 1.8, "dash": "dot"},
+                        marker={"size": 6}, connectgaps=False,
+                    ))
+                    daily_aqi_fig.add_trace(go.Scatter(
+                        x=daily_frame["day_label"], y=daily_frame["min_us_aqi"],
+                        mode="lines+markers", name="Daily minimum",
+                        line={"color": "#6498C9", "width": 1.8, "dash": "dot"},
+                        marker={"size": 6}, connectgaps=False,
+                    ))
+                    daily_aqi_fig.add_trace(go.Scatter(
+                        x=daily_frame["day_label"], y=daily_frame["mean_us_aqi"],
+                        mode="lines+markers", name="Daily average",
+                        line={"color": "#28734A", "width": 3}, marker={"size": 9},
+                        connectgaps=False,
+                        hovertemplate="%{x}<br>Average AQI: %{y:.0f}<extra></extra>",
+                    ))
+                    daily_aqi_fig.update_layout(
+                        yaxis_title="US AQI", legend={"orientation": "h", "y": 1.12, "x": 0},
+                    )
+                    make_chart_layout(daily_aqi_fig, height=350)
+                    st.plotly_chart(daily_aqi_fig, use_container_width=True, config={"displaylogo": False})
+
+                with daily_right:
+                    st.markdown("##### Daily particulate matter")
+                    daily_pm_fig = go.Figure()
+                    daily_pm_fig.add_trace(go.Bar(
+                        x=daily_frame["day_label"], y=daily_frame["mean_pm2_5"],
+                        name="Average PM2.5", marker_color="#28734A",
+                    ))
+                    daily_pm_fig.add_trace(go.Bar(
+                        x=daily_frame["day_label"], y=daily_frame["mean_pm10"],
+                        name="Average PM10", marker_color="#6498C9",
+                    ))
+                    daily_pm_fig.update_layout(
+                        barmode="group", yaxis_title="Concentration (µg/m³)",
+                        legend={"orientation": "h", "y": 1.12, "x": 0},
+                    )
+                    make_chart_layout(daily_pm_fig, height=350)
+                    st.plotly_chart(daily_pm_fig, use_container_width=True, config={"displaylogo": False})
+
+                valid_daily = daily_frame.dropna(subset=["mean_us_aqi"]).copy()
+                daily_metrics = st.columns(4)
+                daily_metric_values = [
+                    ("Average daily AQI", format_value(valid_daily["mean_us_aqi"].mean(), decimals=0)),
+                    ("Highest daily maximum", format_value(daily_frame["max_us_aqi"].max(), decimals=0)),
+                    ("Days with mean AQI above 100", str(int((valid_daily["mean_us_aqi"] > 100).sum()))),
+                    ("Days with AQI data", str(len(valid_daily))),
+                ]
+                for col, (label, value) in zip(daily_metrics, daily_metric_values):
                     with col:
                         st.metric(label, value)
 
-                if forecast_mode == "Hourly":
-                    peak_time_label = pd.Timestamp(peak_row["time"]).strftime("%d %b, %I:%M %p")
-                    clean_time_label = pd.Timestamp(clean_row["time"]).strftime("%d %b, %I:%M %p")
-                    detail_text = (
-                        f"<strong>Highest estimate:</strong> {format_value(peak_row['us_aqi'], decimals=0)} US AQI at {peak_time_label}. "
-                        f"<strong>Lowest estimate:</strong> {format_value(clean_row['us_aqi'], decimals=0)} US AQI at {clean_time_label}. "
-                        f"There are {higher_threshold_count} forecast hours above 150 in this view."
-                    )
-                    category_counts = insight_frame["aqi_category"].value_counts()
-                    category_hover = "%{x}<br>%{y} forecast hours<extra></extra>"
-                    category_title = "Forecast hours by US AQI category"
-                    category_y_title = "Number of hours"
-                else:
-                    peak_day_label = str(peak_row["day_label"])
-                    clean_day_label = str(clean_row["day_label"])
-                    days_above_150 = higher_threshold_count
-                    detail_text = (
-                        f"<strong>Highest daily mean:</strong> {format_value(peak_row['us_aqi'], decimals=0)} US AQI on {html.escape(peak_day_label)}. "
-                        f"<strong>Lowest daily mean:</strong> {format_value(clean_row['us_aqi'], decimals=0)} US AQI on {html.escape(clean_day_label)}. "
-                        f"There are {days_above_150} forecast days with a daily mean above 150."
-                    )
-                    category_counts = insight_frame["aqi_category"].value_counts()
-                    category_hover = "%{x}<br>%{y} forecast days<extra></extra>"
-                    category_title = "Forecast days by daily mean AQI category"
-                    category_y_title = "Number of days"
-
-                st.markdown(
-                    f"<div class='air-info' style='min-height:0;margin:8px 0 14px;'>{detail_text}</div>",
-                    unsafe_allow_html=True,
+                daily_table = daily_frame[[
+                    "day_label", "mean_us_aqi", "min_us_aqi", "max_us_aqi",
+                    "mean_pm2_5", "mean_pm10", "aqi_hours", "available_hours",
+                ]].copy()
+                daily_table["AQI coverage"] = np.where(
+                    daily_table["available_hours"] > 0,
+                    daily_table["aqi_hours"] / daily_table["available_hours"] * 100,
+                    np.nan,
+                )
+                daily_table = daily_table.rename(columns={
+                    "day_label": "Forecast day",
+                    "mean_us_aqi": "Mean AQI",
+                    "min_us_aqi": "Minimum AQI",
+                    "max_us_aqi": "Maximum AQI",
+                    "mean_pm2_5": "Mean PM2.5 (µg/m³)",
+                    "mean_pm10": "Mean PM10 (µg/m³)",
+                    "aqi_hours": "Hours with AQI data",
+                    "available_hours": "Forecast timestamps",
+                })
+                st.markdown("##### Daily forecast details")
+                st.dataframe(
+                    daily_table,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Mean AQI": st.column_config.NumberColumn(format="%.0f"),
+                        "Minimum AQI": st.column_config.NumberColumn(format="%.0f"),
+                        "Maximum AQI": st.column_config.NumberColumn(format="%.0f"),
+                        "Mean PM2.5 (µg/m³)": st.column_config.NumberColumn(format="%.1f"),
+                        "Mean PM10 (µg/m³)": st.column_config.NumberColumn(format="%.1f"),
+                        "AQI coverage": st.column_config.NumberColumn(format="%.0f%%"),
+                    },
                 )
 
-                category_order = ["Good", "Moderate", "Unhealthy for sensitive groups", "Unhealthy", "Very unhealthy", "Hazardous"]
-                category_counts = category_counts.reindex(category_order, fill_value=0)
-                category_counts = category_counts[category_counts > 0]
-                if not category_counts.empty:
-                    category_fig = go.Figure(go.Bar(
-                        x=category_counts.index.tolist(),
-                        y=category_counts.values.tolist(),
-                        marker_color=[AQI_COLORS[name] for name in category_counts.index],
-                        hovertemplate=category_hover,
-                    ))
-                    category_fig.update_layout(
-                        title=category_title,
-                        showlegend=False,
-                        yaxis_title=category_y_title,
-                        xaxis_title="",
-                        bargap=0.35,
-                    )
-                    make_chart_layout(category_fig, height=300)
-                    st.plotly_chart(category_fig, use_container_width=True, config={"displaylogo": False})
-
-                if forecast_mode == "Hourly":
-                    export_frame = chart_frame.copy()
-                    export_frame["aqi_category"] = export_frame["us_aqi"].apply(aqi_category)
-                    export_frame = export_frame.rename(columns={
-                        "time": "local_time",
-                        "us_aqi": "us_aqi_modelled",
-                        "pm2_5": "pm2_5_ug_m3",
-                        "pm10": "pm10_ug_m3",
-                    })
-                    export_suffix = "hourly_forecast"
-                    export_caption = "The CSV contains hourly model estimates, local timestamps and AQI category labels."
-                else:
-                    export_frame = chart_frame.copy().rename(columns={
-                        "forecast_date": "local_date",
-                        "mean_us_aqi": "mean_us_aqi_modelled",
-                        "min_us_aqi": "minimum_us_aqi_modelled",
-                        "max_us_aqi": "maximum_us_aqi_modelled",
-                        "mean_pm2_5": "mean_pm2_5_ug_m3",
-                        "mean_pm10": "mean_pm10_ug_m3",
-                        "aqi_hours": "hours_with_aqi_data",
-                    })
-                    export_suffix = "daily_forecast"
-                    export_caption = "The CSV contains daily summaries calculated from hourly model estimates. Today may be partial."
-
-                city_slug = "".join(ch.lower() if ch.isalnum() else "_" for ch in selected_name).strip("_")
+                daily_export = daily_frame.copy().rename(columns={
+                    "forecast_date": "local_date",
+                    "mean_us_aqi": "mean_us_aqi_modelled",
+                    "min_us_aqi": "minimum_us_aqi_modelled",
+                    "max_us_aqi": "maximum_us_aqi_modelled",
+                    "mean_pm2_5": "mean_pm2_5_ug_m3",
+                    "mean_pm10": "mean_pm10_ug_m3",
+                    "aqi_hours": "hours_with_aqi_data",
+                })
+                daily_export["aqi_category"] = daily_export["mean_us_aqi_modelled"].apply(aqi_category)
                 st.download_button(
-                    "Download forecast data (CSV)",
-                    data=export_frame.to_csv(index=False).encode("utf-8-sig"),
-                    file_name=f"airaware_{city_slug}_{export_suffix}.csv",
+                    "Download daily forecast (CSV)",
+                    data=daily_export.to_csv(index=False).encode("utf-8-sig"),
+                    file_name=f"airaware_{city_slug}_daily_forecast.csv",
                     mime="text/csv",
-                    key="download_selected_forecast_csv",
+                    key="download_daily_forecast_day5",
                     use_container_width=False,
                 )
-                st.caption(export_caption + " Missing values remain blank rather than being estimated.")
 
-                if forecast_mode == "Daily":
-                    daily_table = chart_frame[[
-                        "day_label", "mean_us_aqi", "min_us_aqi", "max_us_aqi",
-                        "mean_pm2_5", "mean_pm10", "aqi_hours",
-                    ]].copy()
-                    daily_table = daily_table.rename(columns={
-                        "day_label": "Forecast day",
-                        "mean_us_aqi": "Mean AQI",
-                        "min_us_aqi": "Minimum AQI",
-                        "max_us_aqi": "Maximum AQI",
-                        "mean_pm2_5": "Mean PM2.5 (µg/m³)",
-                        "mean_pm10": "Mean PM10 (µg/m³)",
-                        "aqi_hours": "Hours with AQI data",
-                    })
-                    st.markdown("##### Daily forecast details")
-                    st.dataframe(
-                        daily_table,
-                        use_container_width=True,
-                        hide_index=True,
-                        column_config={
-                            "Mean AQI": st.column_config.NumberColumn(format="%.0f"),
-                            "Minimum AQI": st.column_config.NumberColumn(format="%.0f"),
-                            "Maximum AQI": st.column_config.NumberColumn(format="%.0f"),
-                            "Mean PM2.5 (µg/m³)": st.column_config.NumberColumn(format="%.1f"),
-                            "Mean PM10 (µg/m³)": st.column_config.NumberColumn(format="%.1f"),
-                        },
-                    )
+            st.caption(
+                "All forecast values are model estimates, not direct observations from a local monitoring station. "
+                "Daily values are calculated from the hourly response returned for this location."
+            )
 
             # ============================================================
-            # DAY 4 FEATURE: WEATHER & POLLUTION RELATIONSHIP EXPLORER
+            # DAY 5 FEATURE: FORECAST VOLATILITY
+            # Show how much the forecast varies over the next 48 hours.
+            # This is a descriptive statistic, not a confidence interval.
+            # ============================================================
+            st.markdown("---")
+            st.markdown('<div class="air-section-label">FORECAST STABILITY</div>', unsafe_allow_html=True)
+            st.markdown("### How much does the forecast change?")
+            volatility_frame = future.head(48).dropna(subset=["us_aqi"]).copy()
+            if len(volatility_frame) >= 2:
+                volatility_frame["aqi_change"] = volatility_frame["us_aqi"].diff()
+                mean_absolute_change = volatility_frame["aqi_change"].abs().dropna().mean()
+                largest_rise = max(0.0, float(volatility_frame["aqi_change"].max()))
+                largest_drop = max(0.0, float(-volatility_frame["aqi_change"].min()))
+                variability = volatility_frame["us_aqi"].std(ddof=0)
+                volatility_cols = st.columns(3)
+                with volatility_cols[0]:
+                    st.metric("Average hourly AQI change", format_value(mean_absolute_change, decimals=1))
+                with volatility_cols[1]:
+                    st.metric("Largest hourly increase", format_value(largest_rise, decimals=1))
+                with volatility_cols[2]:
+                    st.metric("Largest hourly decrease", format_value(largest_drop, decimals=1))
+                st.caption(
+                    f"The standard deviation of the available hourly AQI estimates is {format_value(variability, decimals=1)}. "
+                    "These statistics describe variation within the model forecast; they do not quantify model uncertainty."
+                )
+            else:
+                st.info("At least two hourly AQI estimates are needed to calculate forecast variation.")
+
+            # ENVIRONMENTAL RELATIONSHIPS: WEATHER & POLLUTION EXPLORER
             # These are forecast-to-forecast associations, not causal claims.
             # ============================================================
             st.markdown("---")
@@ -1432,7 +1486,7 @@ else:
             st.markdown("### Weather & pollution explorer")
             st.caption(
                 "Explore whether changes in the weather forecast move alongside changes in the air-quality forecast. "
-                "This analysis always uses matching hourly data, regardless of the Hourly/Daily forecast display above. It is an exploratory association analysis, not proof that weather caused a pollution change."
+                "This analysis independently uses matching hourly weather and air-quality forecasts. It is exploratory and does not prove that weather caused a pollution change."
             )
 
             if selected_hourly_weather.empty:
