@@ -675,7 +675,8 @@ def aggregate_daily_forecast(frame: pd.DataFrame, today: Any = None) -> pd.DataF
     working["time"] = pd.to_datetime(working["time"], errors="coerce")
     for column in ("us_aqi", "pm2_5", "pm10"):
         working[column] = pd.to_numeric(working[column], errors="coerce")
-    working = working.dropna(subset=["time"])
+    working = working.dropna(subset=["time"]).sort_values("time")
+    working = working.drop_duplicates(subset=["time"], keep="last")
     if working.empty:
         return pd.DataFrame()
 
@@ -699,6 +700,181 @@ def aggregate_daily_forecast(frame: pd.DataFrame, today: Any = None) -> pd.DataF
     )
     daily["aqi_category"] = daily["mean_us_aqi"].apply(aqi_category)
     return daily.head(5).reset_index(drop=True)
+
+
+def audit_forecast_data(frame: pd.DataFrame) -> dict[str, Any]:
+    """Summarise completeness and timestamp consistency without changing data."""
+    if frame is None or frame.empty or "time" not in frame.columns:
+        return {
+            "rows": 0, "unique_timestamps": 0, "duplicate_timestamps": 0,
+            "missing_hour_intervals": 0, "irregular_intervals": 0,
+            "continuity_pct": 0.0, "aqi_coverage": 0.0,
+            "pm25_coverage": 0.0, "pm10_coverage": 0.0,
+            "invalid_values": 0, "valid_transitions": 0,
+        }
+
+    working = frame.copy()
+    working["time"] = pd.to_datetime(working["time"], errors="coerce")
+    working = working.dropna(subset=["time"])
+    rows = int(len(working))
+    duplicate_timestamps = int(working.duplicated(subset=["time"], keep="first").sum())
+    unique_times = pd.Series(working["time"].drop_duplicates().sort_values().tolist())
+    intervals = unique_times.diff().dropna()
+    exact_hourly = intervals.eq(pd.Timedelta(hours=1))
+    missing_hour_intervals = 0
+    irregular_intervals = 0
+    for delta in intervals:
+        if delta == pd.Timedelta(hours=1):
+            continue
+        irregular_intervals += 1
+        if delta > pd.Timedelta(hours=1):
+            approximate_hours = int(round(delta / pd.Timedelta(hours=1)))
+            missing_hour_intervals += max(approximate_hours - 1, 0)
+
+    def coverage(column: str) -> float:
+        if rows == 0 or column not in working.columns:
+            return 0.0
+        numeric = pd.to_numeric(working[column], errors="coerce")
+        return float(numeric.notna().sum() / rows * 100.0)
+
+    invalid_values = 0
+    if "us_aqi" in working.columns:
+        aqi_values = pd.to_numeric(working["us_aqi"], errors="coerce")
+        invalid_values += int(((aqi_values < 0) | (aqi_values > 500)).sum())
+    for column in ("pm2_5", "pm10"):
+        if column in working.columns:
+            pollutant_values = pd.to_numeric(working[column], errors="coerce")
+            invalid_values += int((pollutant_values < 0).sum())
+
+    continuity_pct = float(exact_hourly.mean() * 100.0) if len(intervals) else 100.0
+    return {
+        "rows": rows,
+        "unique_timestamps": int(len(unique_times)),
+        "duplicate_timestamps": duplicate_timestamps,
+        "missing_hour_intervals": int(missing_hour_intervals),
+        "irregular_intervals": int(irregular_intervals),
+        "continuity_pct": continuity_pct,
+        "aqi_coverage": coverage("us_aqi"),
+        "pm25_coverage": coverage("pm2_5"),
+        "pm10_coverage": coverage("pm10"),
+        "invalid_values": invalid_values,
+        "valid_transitions": int(exact_hourly.sum()),
+    }
+
+
+def consecutive_hour_changes(frame: pd.DataFrame, value_column: str) -> pd.Series:
+    """Return changes only where two non-missing rows are exactly one hour apart."""
+    if frame is None or frame.empty or not {"time", value_column}.issubset(frame.columns):
+        return pd.Series(dtype=float)
+    working = frame[["time", value_column]].copy()
+    working["time"] = pd.to_datetime(working["time"], errors="coerce")
+    working[value_column] = pd.to_numeric(working[value_column], errors="coerce")
+    working = working.dropna(subset=["time"]).sort_values("time")
+    working = working.drop_duplicates(subset=["time"], keep="last")
+    time_steps = working["time"].diff()
+    value_steps = working[value_column].diff()
+    return value_steps.where(time_steps.eq(pd.Timedelta(hours=1)))
+
+
+def find_best_contiguous_window(frame: pd.DataFrame, window_size: int = 6) -> dict[str, Any] | None:
+    """Find the lowest rolling AQI window without bridging missing-hour gaps."""
+    if frame is None or frame.empty or not {"time", "us_aqi"}.issubset(frame.columns):
+        return None
+    working = frame[["time", "us_aqi"]].copy()
+    working["time"] = pd.to_datetime(working["time"], errors="coerce")
+    working["us_aqi"] = pd.to_numeric(working["us_aqi"], errors="coerce")
+    working = working.dropna(subset=["time", "us_aqi"]).sort_values("time")
+    working = working.drop_duplicates(subset=["time"], keep="last").reset_index(drop=True)
+    if len(working) < window_size:
+        return None
+
+    working["segment"] = working["time"].diff().ne(pd.Timedelta(hours=1)).cumsum()
+    best: dict[str, Any] | None = None
+    for _, segment in working.groupby("segment", sort=False):
+        if len(segment) < window_size:
+            continue
+        rolling_mean = segment["us_aqi"].rolling(window=window_size, min_periods=window_size).mean()
+        if rolling_mean.notna().any():
+            end_index = rolling_mean.idxmin()
+            candidate = {
+                "mean_aqi": float(rolling_mean.loc[end_index]),
+                "end": pd.Timestamp(segment.loc[end_index, "time"]),
+                "start": pd.Timestamp(segment.loc[end_index, "time"]) - pd.Timedelta(hours=window_size - 1),
+                "window_size": int(window_size),
+            }
+            if best is None or candidate["mean_aqi"] < best["mean_aqi"]:
+                best = candidate
+    return best
+
+
+def build_research_dataset(
+    air_frame: pd.DataFrame,
+    weather_frame: pd.DataFrame,
+    *,
+    city: str,
+    region: str,
+    country: str,
+    latitude: float,
+    longitude: float,
+    timezone_name: str,
+) -> pd.DataFrame:
+    """Join forecast variables and create transparent, time-based research features."""
+    if air_frame is None or air_frame.empty or "time" not in air_frame.columns:
+        return pd.DataFrame()
+
+    air = air_frame.copy()
+    air["time"] = pd.to_datetime(air["time"], errors="coerce")
+    air = air.dropna(subset=["time"]).sort_values("time")
+    air = air.drop_duplicates(subset=["time"], keep="last")
+    for column in ("us_aqi", "pm2_5", "pm10"):
+        if column not in air.columns:
+            air[column] = np.nan
+        air[column] = pd.to_numeric(air[column], errors="coerce")
+
+    weather_columns = [
+        "temperature_2m", "relative_humidity_2m", "wind_speed_10m", "precipitation"
+    ]
+    weather = pd.DataFrame(columns=["time", *weather_columns])
+    if weather_frame is not None and not weather_frame.empty and "time" in weather_frame.columns:
+        weather = weather_frame.copy()
+        weather["time"] = pd.to_datetime(weather["time"], errors="coerce")
+        weather = weather.dropna(subset=["time"]).sort_values("time")
+        weather = weather.drop_duplicates(subset=["time"], keep="last")
+        for column in weather_columns:
+            if column not in weather.columns:
+                weather[column] = np.nan
+            weather[column] = pd.to_numeric(weather[column], errors="coerce")
+        weather = weather[["time", *weather_columns]]
+
+    result = air.merge(weather, on="time", how="left", validate="one_to_one")
+    result["city"] = city
+    result["region"] = region
+    result["country"] = country
+    result["latitude"] = float(latitude)
+    result["longitude"] = float(longitude)
+    result["timezone"] = timezone_name
+    result["aqi_category"] = result["us_aqi"].apply(aqi_category)
+    result["local_hour"] = result["time"].dt.hour
+    result["day_of_week"] = result["time"].dt.day_name()
+    result["month"] = result["time"].dt.month
+    result["is_weekend"] = result["time"].dt.dayofweek >= 5
+    result["pm25_to_pm10_ratio"] = np.where(
+        result["pm10"].notna() & (result["pm10"] > 0) & result["pm2_5"].notna(),
+        result["pm2_5"] / result["pm10"],
+        np.nan,
+    )
+    result["aqi_change_1h"] = consecutive_hour_changes(result, "us_aqi").reindex(result.index)
+    result["pm25_change_1h"] = consecutive_hour_changes(result, "pm2_5").reindex(result.index)
+    result["wind_speed_change_1h"] = consecutive_hour_changes(result, "wind_speed_10m").reindex(result.index)
+
+    ordered_columns = [
+        "city", "region", "country", "latitude", "longitude", "timezone", "time",
+        "local_hour", "day_of_week", "month", "is_weekend",
+        "us_aqi", "aqi_category", "pm2_5", "pm10", "pm25_to_pm10_ratio",
+        "temperature_2m", "relative_humidity_2m", "wind_speed_10m", "precipitation",
+        "aqi_change_1h", "pm25_change_1h", "wind_speed_change_1h",
+    ]
+    return result[ordered_columns].reset_index(drop=True)
 
 
 def generate_global_grid() -> list[tuple[float, float]]:
@@ -979,7 +1155,7 @@ st.markdown(
     <div class="air-hero">
       <div class="air-eyebrow">Global environmental intelligence</div>
       <div class="air-title">Understand the air around you.</div>
-      <div class="air-subtitle">Explore modelled air-quality forecasts on a continuous geographic heat layer, select a city from its country and region, review hourly and daily outlooks together, explore forecast insights, download data, and compare major cities worldwide.</div>
+      <div class="air-subtitle">Explore modelled air-quality forecasts on a continuous geographic heat layer, review hourly and daily outlooks together, audit data quality, build a combined air-quality and weather research extract, and compare major cities worldwide.</div>
     </div>
     """,
     unsafe_allow_html=True,
@@ -1155,22 +1331,24 @@ else:
                 st.metric("Feels-like temperature", format_value(selected_weather.get("apparent_temperature"), " °C"))
 
             st.markdown("### Forecasts")
-            future = selected_hourly[selected_hourly["time"] >= local_now.floor("h")].copy()
+            future = (
+                selected_hourly[selected_hourly["time"] >= local_now.floor("h")]
+                .copy()
+                .sort_values("time")
+            )
             if future.empty:
-                future = selected_hourly.copy()
+                st.warning("The API returned no forecast timestamps at or after the current local hour. Past records are not relabelled as future forecasts.")
 
             # ------------------------------------------------------------
-            # DAY 5: DATA AVAILABILITY / QUALITY CHECK
+            # DAY 6: FORECAST DATA HEALTH AUDIT
             # ------------------------------------------------------------
             st.markdown('<div class="air-section-label">FORECAST DATA QUALITY</div>', unsafe_allow_html=True)
-            st.markdown("#### Data availability")
-            expected_rows = int(len(future))
-            aqi_available = int(future["us_aqi"].notna().sum()) if expected_rows else 0
-            pm25_available = int(future["pm2_5"].notna().sum()) if expected_rows else 0
-            pm10_available = int(future["pm10"].notna().sum()) if expected_rows else 0
-            aqi_coverage = (aqi_available / expected_rows * 100.0) if expected_rows else 0.0
-            pm25_coverage = (pm25_available / expected_rows * 100.0) if expected_rows else 0.0
-            pm10_coverage = (pm10_available / expected_rows * 100.0) if expected_rows else 0.0
+            st.markdown("#### Data availability and integrity")
+            quality = audit_forecast_data(future)
+            expected_rows = int(quality["rows"])
+            aqi_coverage = float(quality["aqi_coverage"])
+            pm25_coverage = float(quality["pm25_coverage"])
+            pm10_coverage = float(quality["pm10_coverage"])
 
             quality_cols = st.columns(4)
             with quality_cols[0]:
@@ -1183,10 +1361,21 @@ else:
                 st.metric("PM10 data coverage", f"{pm10_coverage:.0f}%")
 
             st.progress(min(max(aqi_coverage / 100.0, 0.0), 1.0))
+            quality_rows = [
+                {"Validation check": "Duplicate timestamps", "Result": quality["duplicate_timestamps"], "Status": "OK" if quality["duplicate_timestamps"] == 0 else "Review"},
+                {"Validation check": "Missing hourly intervals", "Result": quality["missing_hour_intervals"], "Status": "OK" if quality["missing_hour_intervals"] == 0 else "Review"},
+                {"Validation check": "Irregular time intervals", "Result": quality["irregular_intervals"], "Status": "OK" if quality["irregular_intervals"] == 0 else "Review"},
+                {"Validation check": "Negative / out-of-range values", "Result": quality["invalid_values"], "Status": "OK" if quality["invalid_values"] == 0 else "Review"},
+                {"Validation check": "Consecutive hourly transitions", "Result": quality["valid_transitions"], "Status": "Informational"},
+            ]
+            st.dataframe(pd.DataFrame(quality_rows), use_container_width=True, hide_index=True)
             st.caption(
-                "Coverage is the share of timestamps returned by the API that contain a non-missing value. "
-                "It is not a guarantee of measurement accuracy; the values are atmospheric-model forecasts."
+                f"Timestamp continuity: {quality['continuity_pct']:.0f}%. "
+                "This audit checks missing values, duplicate timestamps and interval consistency. "
+                "It does not measure forecast accuracy or prove that model estimates match conditions on the ground."
             )
+            if quality["duplicate_timestamps"] or quality["missing_hour_intervals"] or quality["invalid_values"]:
+                st.warning("The forecast extract has data-quality issues. Review the checks above before using it for analysis.")
             if aqi_coverage < 80 and expected_rows:
                 st.warning("A noticeable share of AQI values is missing. Interpret the forecast charts with extra caution.")
 
@@ -1253,30 +1442,21 @@ else:
                         with col:
                             st.metric(label, value)
 
-                    # Best six-consecutive-reading window is shown only when
-                    # timestamps are truly hourly and contiguous.
-                    contiguous_hourly = (
-                        len(hourly_insights) >= 6
-                        and hourly_insights["time"].sort_values().diff().dropna().eq(pd.Timedelta(hours=1)).all()
-                    )
-                    if contiguous_hourly:
-                        ordered_hourly = hourly_insights.sort_values("time").set_index("time")
-                        six_reading_average = ordered_hourly["us_aqi"].rolling(window=6, min_periods=6).mean().dropna()
-                        if not six_reading_average.empty:
-                            best_end = six_reading_average.idxmin()
-                            best_start = best_end - pd.Timedelta(hours=5)
-                            best_value = float(six_reading_average.min())
-                            st.markdown(
-                                f"<div class='air-info' style='min-height:0;margin:10px 0;'>"
-                                f"<strong>Lowest six-consecutive-reading average:</strong> {best_value:.0f} US AQI, "
-                                f"from {html.escape(best_start.strftime('%d %b, %I:%M %p'))} "
-                                f"to {html.escape(best_end.strftime('%d %b, %I:%M %p'))}. "
-                                "This is a comparison within the model forecast, not a guarantee of future conditions."
-                                f"</div>",
-                                unsafe_allow_html=True,
-                            )
+                    # Search each uninterrupted hourly segment independently. Missing
+                    # AQI values no longer prevent analysis of valid six-hour windows.
+                    best_window = find_best_contiguous_window(hourly_frame, window_size=6)
+                    if best_window is not None:
+                        st.markdown(
+                            f"<div class='air-info' style='min-height:0;margin:10px 0;'>"
+                            f"<strong>Lowest six-consecutive-hour average:</strong> {best_window['mean_aqi']:.0f} US AQI, "
+                            f"from {html.escape(best_window['start'].strftime('%d %b, %I:%M %p'))} "
+                            f"to {html.escape(best_window['end'].strftime('%d %b, %I:%M %p'))}. "
+                            "This is a comparison within the model forecast, not a guarantee of future conditions."
+                            f"</div>",
+                            unsafe_allow_html=True,
+                        )
                     else:
-                        st.caption("A six-hour window summary is shown only when at least six consecutive hourly AQI readings are available.")
+                        st.caption("A six-hour summary needs at least six consecutive hourly AQI readings in one uninterrupted segment.")
 
                     hourly_category_counts = hourly_insights["aqi_category"].value_counts()
                     category_order = [
@@ -1457,26 +1637,31 @@ else:
             st.markdown("---")
             st.markdown('<div class="air-section-label">FORECAST STABILITY</div>', unsafe_allow_html=True)
             st.markdown("### How much does the forecast change?")
-            volatility_frame = future.head(48).dropna(subset=["us_aqi"]).copy()
-            if len(volatility_frame) >= 2:
-                volatility_frame["aqi_change"] = volatility_frame["us_aqi"].diff()
-                mean_absolute_change = volatility_frame["aqi_change"].abs().dropna().mean()
-                largest_rise = max(0.0, float(volatility_frame["aqi_change"].max()))
-                largest_drop = max(0.0, float(-volatility_frame["aqi_change"].min()))
-                variability = volatility_frame["us_aqi"].std(ddof=0)
-                volatility_cols = st.columns(3)
+            volatility_frame = future.head(48).copy().sort_values("time")
+            volatility_frame["aqi_change"] = consecutive_hour_changes(volatility_frame, "us_aqi").reindex(volatility_frame.index)
+            valid_changes = volatility_frame["aqi_change"].dropna()
+            available_aqi = pd.to_numeric(volatility_frame["us_aqi"], errors="coerce").dropna()
+            if not valid_changes.empty:
+                mean_absolute_change = valid_changes.abs().mean()
+                largest_rise = max(0.0, float(valid_changes.max()))
+                largest_drop = max(0.0, float(-valid_changes.min()))
+                variability = available_aqi.std(ddof=0) if len(available_aqi) else np.nan
+                volatility_cols = st.columns(4)
                 with volatility_cols[0]:
                     st.metric("Average hourly AQI change", format_value(mean_absolute_change, decimals=1))
                 with volatility_cols[1]:
                     st.metric("Largest hourly increase", format_value(largest_rise, decimals=1))
                 with volatility_cols[2]:
                     st.metric("Largest hourly decrease", format_value(largest_drop, decimals=1))
+                with volatility_cols[3]:
+                    st.metric("Valid 1-hour comparisons", str(len(valid_changes)))
                 st.caption(
-                    f"The standard deviation of the available hourly AQI estimates is {format_value(variability, decimals=1)}. "
-                    "These statistics describe variation within the model forecast; they do not quantify model uncertainty."
+                    f"The standard deviation of available AQI estimates is {format_value(variability, decimals=1)}. "
+                    "Changes are calculated only between timestamps exactly one hour apart, so gaps are not treated as hourly changes. "
+                    "These statistics do not quantify model uncertainty."
                 )
             else:
-                st.info("At least two hourly AQI estimates are needed to calculate forecast variation.")
+                st.info("At least two non-missing AQI estimates exactly one hour apart are needed to calculate hourly forecast changes.")
 
             # ENVIRONMENTAL RELATIONSHIPS: WEATHER & POLLUTION EXPLORER
             # These are forecast-to-forecast associations, not causal claims.
@@ -1495,8 +1680,10 @@ else:
                     with st.expander("Weather data details"):
                         st.code(hourly_weather_error)
             else:
-                relationship_data = selected_hourly.merge(
-                    selected_hourly_weather,
+                relationship_air = selected_hourly.drop_duplicates(subset=["time"], keep="last")
+                relationship_weather = selected_hourly_weather.drop_duplicates(subset=["time"], keep="last")
+                relationship_data = relationship_air.merge(
+                    relationship_weather,
                     on="time",
                     how="inner",
                     validate="one_to_one",
@@ -1621,6 +1808,56 @@ else:
                         "Spearman r describes how two variables move together in this forecast window; "
                         "it does not establish causation and should not be generalized beyond this city and period."
                     )
+
+            # ============================================================
+            # DAY 6: RESEARCH-READY FORECAST EXTRACT
+            # Joins air quality and weather with transparent time features.
+            # This is a forecast extract, not historical ground-truth data.
+            # ============================================================
+            st.markdown("---")
+            st.markdown('<div class="air-section-label">RESEARCH WORKSPACE</div>', unsafe_allow_html=True)
+            st.markdown("### Build a combined research dataset")
+            st.caption(
+                "Combine hourly air-quality and weather forecasts into one structured CSV. "
+                "The file includes city metadata, local calendar features, pollutant values, weather variables, "
+                "and one-hour changes calculated only across consecutive timestamps."
+            )
+            research_dataset = build_research_dataset(
+                future,
+                selected_hourly_weather,
+                city=selected_name,
+                region=selected_region_for_data,
+                country=selected_country_for_data,
+                latitude=float(selected_place["latitude"]),
+                longitude=float(selected_place["longitude"]),
+                timezone_name=selected_timezone,
+            )
+            if research_dataset.empty:
+                st.info("There are no forecast rows available to export for this location.")
+            else:
+                matched_weather_rows = int(research_dataset["temperature_2m"].notna().sum())
+                research_cols = st.columns(3)
+                with research_cols[0]:
+                    st.metric("Research rows", len(research_dataset))
+                with research_cols[1]:
+                    st.metric("Available variables", len(research_dataset.columns))
+                with research_cols[2]:
+                    st.metric("Rows with weather data", f"{matched_weather_rows}/{len(research_dataset)}")
+                st.dataframe(research_dataset.head(10), use_container_width=True, hide_index=True)
+                research_slug = "".join(ch.lower() if ch.isalnum() else "_" for ch in selected_name).strip("_")
+                st.download_button(
+                    "Download combined research dataset (CSV)",
+                    data=research_dataset.to_csv(index=False).encode("utf-8-sig"),
+                    file_name=f"airaware_{research_slug}_research_forecast.csv",
+                    mime="text/csv",
+                    key="download_research_dataset_day6",
+                    use_container_width=False,
+                )
+                st.caption(
+                    "Research note: this export contains model forecasts for future timestamps, not observed historical outcomes. "
+                    "It is useful for exploring features and preparing a data pipeline, but it must not be used as ground-truth labels "
+                    "to claim predictive model accuracy. A later modelling stage will need archived historical observations and a time-based evaluation split."
+                )
 
         else:
             st.info("The city was selected, but hourly air-quality forecast data is temporarily unavailable.")
