@@ -73,6 +73,35 @@ FEATURED_CITIES = [
     ("Auckland", "New Zealand", -36.8509, 174.7645),
 ]
 
+# Additional map-only sampling locations. These improve geographic coverage
+# without making the city-comparison table unnecessarily long.
+GLOBAL_MAP_EXTRA_POINTS = [
+    ("Seattle", "United States", 47.6062, -122.3321),
+    ("Chicago", "United States", 41.8781, -87.6298),
+    ("Boston", "United States", 42.3601, -71.0589),
+    ("Miami", "United States", 25.7617, -80.1918),
+    ("Houston", "United States", 29.7604, -95.3698),
+    ("Montreal", "Canada", 45.5019, -73.5674),
+    ("Calgary", "Canada", 51.0447, -114.0719),
+    ("Santiago", "Chile", -33.4489, -70.6693),
+    ("Medellin", "Colombia", 6.2442, -75.5812),
+    ("Lisbon", "Portugal", 38.7223, -9.1393),
+    ("Amsterdam", "Netherlands", 52.3676, 4.9041),
+    ("Warsaw", "Poland", 52.2297, 21.0122),
+    ("Athens", "Greece", 37.9838, 23.7275),
+    ("Casablanca", "Morocco", 33.5731, -7.5898),
+    ("Accra", "Ghana", 5.6037, -0.1870),
+    ("Addis Ababa", "Ethiopia", 8.9806, 38.7578),
+    ("Tehran", "Iran", 35.6892, 51.3890),
+    ("Kathmandu", "Nepal", 27.7172, 85.3240),
+    ("Hanoi", "Vietnam", 21.0278, 105.8342),
+    ("Manila", "Philippines", 14.5995, 120.9842),
+    ("Taipei", "Taiwan", 25.0330, 121.5654),
+    ("Osaka", "Japan", 34.6937, 135.5023),
+    ("Perth", "Australia", -31.9505, 115.8605),
+    ("Brisbane", "Australia", -27.4698, 153.0251),
+]
+
 AQI_COLORS = {
     "Good": "#16845B",
     "Moderate": "#B28A00",
@@ -878,9 +907,10 @@ def build_research_dataset(
 
 
 def generate_global_grid() -> list[tuple[float, float]]:
-    # Representative featured-city samples keep the global view lightweight.
-    # Interpolated areas are a visual summary, not measurements between cities.
-    points = [(float(lat), float(lon)) for _, _, lat, lon in FEATURED_CITIES]
+    # A broader set of map-only metropolitan samples gives more even coverage
+    # across continents. The surface remains an interpolation, not a sensor map.
+    locations = FEATURED_CITIES + GLOBAL_MAP_EXTRA_POINTS
+    points = [(float(lat), float(lon)) for _, _, lat, lon in locations]
     return list(dict.fromkeys(points))
 
 
@@ -900,29 +930,58 @@ def generate_local_grid(latitude: float, longitude: float) -> list[tuple[float, 
 
 
 def fetch_chunk(points: tuple[tuple[float, float], ...]) -> tuple[pd.DataFrame, str | None]:
+    """Fetch one coordinate batch and preserve rows even if the request fails."""
     try:
-        return fetch_current_batch(tuple(points)), None
+        frame = fetch_current_batch(tuple(points))
+        return frame, None
     except (requests.RequestException, ValueError, KeyError) as exc:
-        return pd.DataFrame(), str(exc)
+        # Keep each requested coordinate in the result. This prevents a failed
+        # middle batch from shifting city names against unrelated AQI values.
+        fallback = pd.DataFrame([
+            {
+                "latitude": lat,
+                "longitude": lon,
+                "requested_latitude": lat,
+                "requested_longitude": lon,
+                "us_aqi": np.nan,
+                "pm2_5": np.nan,
+                "pm10": np.nan,
+                "time": "",
+            }
+            for lat, lon in points
+        ])
+        return fallback, str(exc)
 
 
 def collect_samples(points: list[tuple[float, float]], chunk_size: int = 36) -> tuple[pd.DataFrame, int]:
+    """Collect multi-location samples while preserving the original point order."""
     chunks = [tuple(points[i:i + chunk_size]) for i in range(0, len(points), chunk_size)]
     if not chunks:
-        return pd.DataFrame(), 0
+        return pd.DataFrame(columns=["latitude", "longitude", "requested_latitude", "requested_longitude", "us_aqi", "pm2_5", "pm10", "time"]), 0
     frames: list[pd.DataFrame] = []
     failures = 0
     with ThreadPoolExecutor(max_workers=4) as executor:
         for frame, error in executor.map(fetch_chunk, chunks):
-            if error or frame.empty:
+            if error:
                 failures += 1
-            else:
+            if frame is not None and not frame.empty:
                 frames.append(frame)
     if not frames:
-        return pd.DataFrame(), failures
-    return pd.concat(frames, ignore_index=True), failures
+        return pd.DataFrame(columns=["latitude", "longitude", "requested_latitude", "requested_longitude", "us_aqi", "pm2_5", "pm10", "time"]), failures
+    combined = pd.concat(frames, ignore_index=True)
+    # Defensive sort by the requested coordinate sequence. The function's
+    # callers can also join by coordinates, but the order is now deterministic.
+    order = { (round(float(lat), 4), round(float(lon), 4)): i for i, (lat, lon) in enumerate(points) }
+    if {"requested_latitude", "requested_longitude"}.issubset(combined.columns):
+        combined["_point_order"] = combined.apply(
+            lambda row: order.get((round(float(row["requested_latitude"]), 4), round(float(row["requested_longitude"]), 4)), len(order)),
+            axis=1,
+        )
+        combined = combined.sort_values("_point_order", kind="stable").drop(columns="_point_order")
+    return combined.reset_index(drop=True), failures
 
 
+@st.cache_data(ttl=900, show_spinner=False)
 def interpolate_raster(
     frame: pd.DataFrame,
     bounds: tuple[float, float, float, float],
@@ -1155,7 +1214,7 @@ st.markdown(
     <div class="air-hero">
       <div class="air-eyebrow">Global environmental intelligence</div>
       <div class="air-title">Understand the air around you.</div>
-      <div class="air-subtitle">Explore modelled air-quality forecasts on a continuous geographic heat layer, review hourly and daily outlooks together, audit data quality, build a combined air-quality and weather research extract, and compare major cities worldwide.</div>
+      <div class="air-subtitle">Explore modelled air-quality forecasts on a geographic heat layer, review hourly and daily outlooks, audit data quality, build research extracts, and compare major cities worldwide.</div>
     </div>
     """,
     unsafe_allow_html=True,
@@ -1163,25 +1222,43 @@ st.markdown(
 
 # ============================================================
 # WORLD / LOCAL MAP
-# ============================================================
 
 st.markdown('<div class="air-section-label">AIR QUALITY MAP</div>', unsafe_allow_html=True)
-st.markdown('<div class="air-legend"><div class="air-gradient"></div><span>Lower estimate</span><span>→</span><span>Higher estimate</span></div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="air-legend"><div class="air-gradient"></div>'
+    '<span>Lower estimate</span><span>→</span><span>Higher estimate</span></div>',
+    unsafe_allow_html=True,
+)
+st.caption(
+    "Classic OpenStreetMap basemap with the interpolated AQI heat layer. "
+    "This original map uses OpenStreetMap tiles and does not require a "
+    "Mapbox, Esri, Carto, or other mapping-provider API key."
+)
 
 if selected_city_id is None:
     st.subheader("Global air-quality overview")
-    st.caption("A continuous raster-style visualization interpolated from a coarse global sample. Select a city in the sidebar to zoom into its local heat layer.")
+    st.caption(
+        "The world view uses modelled AQI samples from representative major "
+        "cities. Select a city in the sidebar to zoom into its local heat layer."
+    )
     with st.spinner("Loading representative global air-quality forecasts..."):
         global_points = generate_global_grid()
         global_map_frame, global_failures = collect_samples(global_points, chunk_size=36)
 
     if not global_map_frame.empty:
-        global_map_frame = global_map_frame.dropna(subset=["latitude", "longitude", "us_aqi"])
+        global_map_frame = global_map_frame.dropna(
+            subset=["latitude", "longitude", "us_aqi"]
+        )
         global_map_frame["lat_bin"] = global_map_frame["latitude"].round(2)
         global_map_frame["lon_bin"] = global_map_frame["longitude"].round(2)
-        global_map_frame = global_map_frame.groupby(["lat_bin", "lon_bin"], as_index=False).agg(
-            latitude=("latitude", "mean"), longitude=("longitude", "mean"), us_aqi=("us_aqi", "mean"),
-            pm2_5=("pm2_5", "mean"), pm10=("pm10", "mean"),
+        global_map_frame = global_map_frame.groupby(
+            ["lat_bin", "lon_bin"], as_index=False
+        ).agg(
+            latitude=("latitude", "mean"),
+            longitude=("longitude", "mean"),
+            us_aqi=("us_aqi", "mean"),
+            pm2_5=("pm2_5", "mean"),
+            pm10=("pm10", "mean"),
         )
     else:
         global_map_frame = pd.DataFrame()
@@ -1197,18 +1274,47 @@ if selected_city_id is None:
         height=650,
     )
     display_map(world_map, height=650)
-    if global_map_frame.empty:
-        st.warning("The street basemap is visible, but live AQI samples were unavailable for the heat layer. Check your internet connection and refresh.")
-    else:
-        st.caption("Global heat regions are interpolated from representative city forecasts. They are a broad visual overview, not measurements at every map pixel.")
 
+    if global_map_frame.empty:
+        st.warning(
+            "The OpenStreetMap basemap is visible, but no usable AQI samples "
+            "were returned for the heat layer. Check your internet connection "
+            "and try Refresh data."
+        )
+    else:
+        valid_global_samples = int(global_map_frame["us_aqi"].notna().sum())
+        map_metric_a, map_metric_b, map_metric_c = st.columns(3)
+        with map_metric_a:
+            st.metric("Valid map samples", valid_global_samples)
+        with map_metric_b:
+            st.metric("Sample locations requested", len(global_points))
+        with map_metric_c:
+            st.metric("Failed request batches", global_failures)
+        st.caption(
+            "The heat layer is an interpolation between modelled forecasts at "
+            "representative city coordinates. It is a visual summary, not a "
+            "measurement at every map pixel."
+        )
+        if global_failures:
+            st.warning(
+                f"{global_failures} map-data request batch(es) failed. "
+                "Locations from failed batches are left without AQI values."
+            )
 else:
     if selected_place is None:
-        st.warning("The selected city could not be resolved to map coordinates. The world street basemap is shown until the location service responds.")
+        st.warning(
+            "The selected city could not be resolved to map coordinates. "
+            "The global OpenStreetMap view is shown until location data is available."
+        )
         fallback_map = build_folium_map(
-            pd.DataFrame(), center=(18, 0), zoom=2,
-            bounds=(-180, -60, 180, 80), smoothing_km=1450,
-            raster_width=720, raster_height=360, height=650,
+            pd.DataFrame(),
+            center=(18, 0),
+            zoom=2,
+            bounds=(-180, -60, 180, 80),
+            smoothing_km=1450,
+            raster_width=720,
+            raster_height=360,
+            height=650,
         )
         display_map(fallback_map, height=650)
     else:
@@ -1217,36 +1323,72 @@ else:
         place_country = str(selected_place.get("country") or selected_city_row["country"])
         lat = float(selected_place["latitude"])
         lon = float(selected_place["longitude"])
+
         st.subheader(f"Air quality around {place_name}")
-        st.caption(f"{place_region}, {place_country} · The map automatically centres on the selected city. No city markers are added; the geographic surface is the heat layer.")
+        st.caption(
+            f"{place_region}, {place_country} · The map automatically centres "
+            "on the selected city. The coloured surface is an interpolated "
+            "modelled AQI heat layer, not street-level sensor coverage."
+        )
+
         with st.spinner(f"Building the local heat layer around {place_name}..."):
-            local_frame, local_failures = collect_samples(generate_local_grid(lat, lon), chunk_size=36)
-        local_frame = local_frame.dropna(subset=["latitude", "longitude", "us_aqi"]) if not local_frame.empty else pd.DataFrame()
+            local_frame, local_failures = collect_samples(
+                generate_local_grid(lat, lon), chunk_size=36
+            )
+
+        if not local_frame.empty:
+            local_frame = local_frame.dropna(
+                subset=["latitude", "longitude", "us_aqi"]
+            )
+
         half_lat = 0.85
         half_lon = min(0.85 / max(abs(math.cos(math.radians(lat))), 0.2), 4.0)
+        west = max(-179.8, lon - half_lon)
+        east = min(179.8, lon + half_lon)
+        south = max(-84.5, lat - half_lat)
+        north = min(84.5, lat + half_lat)
+
         local_map = build_folium_map(
             local_frame,
             center=(lat, lon),
             zoom=9,
-            bounds=(lon - half_lon, lat - half_lat, lon + half_lon, lat + half_lat),
+            bounds=(west, south, east, north),
             smoothing_km=22,
             raster_width=640,
             raster_height=540,
             height=650,
         )
         display_map(local_map, height=650)
+
         if local_frame.empty:
-            st.warning("The street basemap is visible, but no usable AQI samples were returned for this city right now.")
+            st.warning(
+                "The OpenStreetMap basemap is visible, but no usable local AQI "
+                "samples were returned for the heat layer."
+            )
         else:
-            st.caption("Local heat layer is interpolated from nearby forecast-grid samples. Its spatial detail is limited by the atmospheric model resolution.")
+            valid_local_samples = int(local_frame["us_aqi"].notna().sum())
+            local_metric_a, local_metric_b = st.columns(2)
+            with local_metric_a:
+                st.metric("Valid local samples", valid_local_samples)
+            with local_metric_b:
+                st.metric("Failed request batches", local_failures)
+            st.caption(
+                "Nearby coordinates may resolve to the same atmospheric-model "
+                "grid cell. The heat layer is therefore not equivalent to "
+                "street-level sensor measurements."
+            )
+            if local_failures:
+                st.warning(f"{local_failures} local map-data request batch(es) failed.")
 
 
-# ============================================================
 # SELECTED CITY CONDITIONS + FORECAST TRENDS
 # ============================================================
 
 st.markdown("---")
 st.markdown('<div class="air-section-label">SELECTED LOCATION</div>', unsafe_allow_html=True)
+selected_aqi_for_benchmark: float | None = None
+selected_city_for_benchmark: str | None = None
+selected_country_for_benchmark: str | None = None
 if selected_city_id is None:
     st.subheader("World overview")
     st.caption("No city is selected. Choose a country, region and city in the sidebar to display local conditions and forecasts.")
@@ -1300,6 +1442,9 @@ else:
             nearest_idx = (source["time"] - local_now).abs().idxmin()
             current = source.loc[nearest_idx]
             current_aqi = safe_number(current.get("us_aqi"))
+            selected_aqi_for_benchmark = current_aqi
+            selected_city_for_benchmark = selected_name
+            selected_country_for_benchmark = selected_country_for_data
             category = aqi_category(current_aqi)
             st.markdown(
                 f"""
@@ -1340,7 +1485,7 @@ else:
                 st.warning("The API returned no forecast timestamps at or after the current local hour. Past records are not relabelled as future forecasts.")
 
             # ------------------------------------------------------------
-            # DAY 6: FORECAST DATA HEALTH AUDIT
+            # Forecast data health audit
             # ------------------------------------------------------------
             st.markdown('<div class="air-section-label">FORECAST DATA QUALITY</div>', unsafe_allow_html=True)
             st.markdown("#### Data availability and integrity")
@@ -1810,7 +1955,7 @@ else:
                     )
 
             # ============================================================
-            # DAY 6: RESEARCH-READY FORECAST EXTRACT
+            # Research-ready forecast extract
             # Joins air quality and weather with transparent time features.
             # This is a forecast extract, not historical ground-truth data.
             # ============================================================
@@ -1877,11 +2022,51 @@ with st.spinner("Loading comparison city forecasts..."):
     comparison_frame, comparison_failures = collect_samples(comparison_points, chunk_size=36)
 
 if not comparison_frame.empty:
-    count = min(len(comparison_frame), len(FEATURED_CITIES))
-    comparison_frame = comparison_frame.iloc[:count].copy()
-    comparison_frame["city"] = [item[0] for item in FEATURED_CITIES[:count]]
-    comparison_frame["country"] = [item[1] for item in FEATURED_CITIES[:count]]
-    render_comparison_table(comparison_frame[["city", "country", "us_aqi", "pm2_5", "pm10"]])
+    city_lookup = {
+        (round(float(lat), 4), round(float(lon), 4)): (name, country)
+        for name, country, lat, lon in FEATURED_CITIES
+    }
+    comparison_frame = comparison_frame.copy()
+    comparison_frame["_lookup"] = comparison_frame.apply(
+        lambda row: city_lookup.get((
+            round(float(row["requested_latitude"]), 4),
+            round(float(row["requested_longitude"]), 4),
+        ), ("Unknown location", "Unknown country")),
+        axis=1,
+    )
+    comparison_frame["city"] = comparison_frame["_lookup"].apply(lambda item: item[0])
+    comparison_frame["country"] = comparison_frame["_lookup"].apply(lambda item: item[1])
+    comparison_frame = comparison_frame.drop(columns=["_lookup"])
+    comparison_view = comparison_frame[["city", "country", "us_aqi", "pm2_5", "pm10"]].copy()
+    render_comparison_table(comparison_view)
+    if comparison_failures:
+        st.warning(f"{comparison_failures} comparison-data request batch(es) failed. Missing values are shown as unavailable.")
+
+    # Benchmark the selected location against this fixed representative sample.
+    # Exclude the same city/country pair to avoid comparing a value with itself.
+    if selected_aqi_for_benchmark is not None:
+        benchmark = comparison_view.dropna(subset=["us_aqi"]).copy()
+        if selected_city_for_benchmark and selected_country_for_benchmark:
+            same_location = (
+                benchmark["city"].str.casefold().eq(selected_city_for_benchmark.casefold())
+                & benchmark["country"].str.casefold().eq(selected_country_for_benchmark.casefold())
+            )
+            benchmark = benchmark.loc[~same_location]
+        if len(benchmark) >= 3:
+            values = pd.to_numeric(benchmark["us_aqi"], errors="coerce").dropna()
+            worse_count = int((values > selected_aqi_for_benchmark).sum())
+            rank = worse_count + 1
+            sample_size = len(values) + 1
+            lower_share = float((values < selected_aqi_for_benchmark).mean() * 100.0)
+            st.markdown("#### Selected city vs worldwide sample")
+            bench_a, bench_b, bench_c = st.columns(3)
+            with bench_a:
+                st.metric("AQI rank in sample", f"{rank} / {sample_size}", help="Ranked from highest modelled AQI to lowest; higher AQI is worse on the US AQI scale.")
+            with bench_b:
+                st.metric("Higher than", f"{lower_share:.0f}%", help="Percentage of available comparison cities with a lower modelled US AQI.")
+            with bench_c:
+                st.metric("Cities compared", len(values))
+            st.caption("This benchmark compares modelled AQI values from representative city coordinates. It is not a ranking of every city worldwide or an official public-health comparison.")
 else:
     st.info("Global city comparison is temporarily unavailable. Try Refresh data.")
 
