@@ -606,10 +606,59 @@ def fetch_hourly_air(latitude: float, longitude: float, timezone_name: str) -> p
     if "hourly" not in payload or "time" not in payload["hourly"]:
         raise ValueError("Unexpected hourly air-quality response.")
     frame = pd.DataFrame(payload["hourly"])
+    if "time" not in frame.columns:
+        raise ValueError("The air-quality response did not include timestamps.")
     frame["time"] = pd.to_datetime(frame["time"], errors="coerce")
-    frame = frame.dropna(subset=["time"]).reset_index(drop=True)
+    frame = frame.dropna(subset=["time"]).sort_values("time", kind="stable").reset_index(drop=True)
     for column in ("us_aqi", "pm2_5", "pm10"):
+        if column not in frame.columns:
+            frame[column] = np.nan
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    return frame
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def fetch_historical_air_quality(
+    latitude: float,
+    longitude: float,
+    timezone_name: str,
+    past_days: int,
+) -> pd.DataFrame:
+    """Fetch archived modelled air-quality data for the previous 7–90 days.
+
+    Open-Meteo's Air Quality API past_days option returns archived model output.
+    These values are not equivalent to independent ground-monitor observations.
+    """
+    days = int(past_days)
+    if days not in (7, 30, 60, 90):
+        raise ValueError("Choose a supported historical period: 7, 30, 60 or 90 days.")
+
+    params = {
+        "latitude": float(latitude),
+        "longitude": float(longitude),
+        "hourly": "us_aqi,pm2_5,pm10",
+        "past_days": days,
+        "forecast_days": 0,
+        "timezone": timezone_name or TIMEZONE_DEFAULT,
+        "cell_selection": "land",
+    }
+    response = requests.get(AIR_URL, params=params, timeout=45)
+    response.raise_for_status()
+    payload = response.json()
+    if "hourly" not in payload or "time" not in payload["hourly"]:
+        message = payload.get("reason") or payload.get("error") or "Unexpected historical air-quality response."
+        raise ValueError(str(message))
+
+    frame = pd.DataFrame(payload["hourly"])
+    if "time" not in frame.columns:
+        raise ValueError("The historical response did not include timestamps.")
+    frame["time"] = pd.to_datetime(frame["time"], errors="coerce")
+    frame = frame.dropna(subset=["time"]).sort_values("time", kind="stable")
+    for column in ("us_aqi", "pm2_5", "pm10"):
+        if column not in frame.columns:
+            frame[column] = np.nan
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame = frame.drop_duplicates(subset=["time"], keep="last").reset_index(drop=True)
     return frame
 
 
@@ -629,9 +678,13 @@ def fetch_hourly_weather(latitude: float, longitude: float, timezone_name: str) 
     if "hourly" not in payload or "time" not in payload["hourly"]:
         raise ValueError("Unexpected hourly weather response.")
     frame = pd.DataFrame(payload["hourly"])
+    if "time" not in frame.columns:
+        raise ValueError("The weather response did not include timestamps.")
     frame["time"] = pd.to_datetime(frame["time"], errors="coerce")
-    frame = frame.dropna(subset=["time"]).reset_index(drop=True)
+    frame = frame.dropna(subset=["time"]).sort_values("time", kind="stable").reset_index(drop=True)
     for column in ("temperature_2m", "relative_humidity_2m", "wind_speed_10m", "precipitation"):
+        if column not in frame.columns:
+            frame[column] = np.nan
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
     return frame
 
@@ -731,6 +784,56 @@ def aggregate_daily_forecast(frame: pd.DataFrame, today: Any = None) -> pd.DataF
     return daily.head(5).reset_index(drop=True)
 
 
+def summarize_historical_air_quality(frame: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate archived AQI model output into local calendar-day summaries."""
+    columns = ["date", "mean_us_aqi", "min_us_aqi", "max_us_aqi", "mean_pm2_5", "mean_pm10", "aqi_records", "total_records"]
+    if frame is None or frame.empty or "time" not in frame.columns:
+        return pd.DataFrame(columns=columns)
+
+    working = frame.copy()
+    working["time"] = pd.to_datetime(working["time"], errors="coerce")
+    working = working.dropna(subset=["time"]).sort_values("time", kind="stable")
+    working = working.drop_duplicates(subset=["time"], keep="last")
+    for column in ("us_aqi", "pm2_5", "pm10"):
+        if column not in working.columns:
+            working[column] = np.nan
+        working[column] = pd.to_numeric(working[column], errors="coerce")
+    working["date"] = working["time"].dt.date
+    summary = (
+        working.groupby("date", as_index=False, sort=True)
+        .agg(
+            mean_us_aqi=("us_aqi", "mean"),
+            min_us_aqi=("us_aqi", "min"),
+            max_us_aqi=("us_aqi", "max"),
+            mean_pm2_5=("pm2_5", "mean"),
+            mean_pm10=("pm10", "mean"),
+            aqi_records=("us_aqi", "count"),
+            total_records=("time", "count"),
+        )
+    )
+    summary["aqi_category"] = summary["mean_us_aqi"].apply(aqi_category)
+    summary["mean_7d_aqi"] = summary["mean_us_aqi"].rolling(7, min_periods=3).mean()
+    return summary[columns + ["aqi_category", "mean_7d_aqi"]]
+
+
+def infer_sample_interval(frame: pd.DataFrame) -> str:
+    """Describe the typical archived-data cadence without assuming hourly data."""
+    if frame is None or frame.empty or "time" not in frame.columns:
+        return "Unavailable"
+    times = pd.to_datetime(frame["time"], errors="coerce").dropna().drop_duplicates().sort_values()
+    deltas = times.diff().dropna()
+    if deltas.empty:
+        return "Not enough timestamps"
+    median_minutes = float(deltas.dt.total_seconds().median() / 60.0)
+    if median_minutes <= 0:
+        return "Irregular"
+    if median_minutes < 90:
+        return f"About {median_minutes:.0f} minutes"
+    if median_minutes % 60 == 0:
+        return f"About {median_minutes / 60:.0f} hours"
+    return f"About {median_minutes:.0f} minutes"
+
+
 def audit_forecast_data(frame: pd.DataFrame) -> dict[str, Any]:
     """Summarise completeness and timestamp consistency without changing data."""
     if frame is None or frame.empty or "time" not in frame.columns:
@@ -792,17 +895,29 @@ def audit_forecast_data(frame: pd.DataFrame) -> dict[str, Any]:
 
 
 def consecutive_hour_changes(frame: pd.DataFrame, value_column: str) -> pd.Series:
-    """Return changes only where two non-missing rows are exactly one hour apart."""
+    """Return row-aligned changes only across exact one-hour intervals.
+
+    The returned Series always uses the input frame's index. This matters after
+    merges/sorts: it prevents a calculated change from being attached to a
+    different timestamp when rows are not in their original order.
+    """
     if frame is None or frame.empty or not {"time", value_column}.issubset(frame.columns):
-        return pd.Series(dtype=float)
+        return pd.Series(index=getattr(frame, "index", []), dtype=float)
+
+    output = pd.Series(np.nan, index=frame.index, dtype=float)
     working = frame[["time", value_column]].copy()
+    working["_source_index"] = frame.index
     working["time"] = pd.to_datetime(working["time"], errors="coerce")
     working[value_column] = pd.to_numeric(working[value_column], errors="coerce")
-    working = working.dropna(subset=["time"]).sort_values("time")
+    working = working.dropna(subset=["time"]).sort_values("time", kind="stable")
     working = working.drop_duplicates(subset=["time"], keep="last")
+
     time_steps = working["time"].diff()
     value_steps = working[value_column].diff()
-    return value_steps.where(time_steps.eq(pd.Timedelta(hours=1)))
+    changes = value_steps.where(time_steps.eq(pd.Timedelta(hours=1)))
+    source_indices = working["_source_index"].tolist()
+    output.loc[source_indices] = changes.to_numpy(dtype=float)
+    return output
 
 
 def find_best_contiguous_window(frame: pd.DataFrame, window_size: int = 6) -> dict[str, Any] | None:
@@ -1214,7 +1329,7 @@ st.markdown(
     <div class="air-hero">
       <div class="air-eyebrow">Global environmental intelligence</div>
       <div class="air-title">Understand the air around you.</div>
-      <div class="air-subtitle">Explore modelled air-quality forecasts on a geographic heat layer, review hourly and daily outlooks, audit data quality, build research extracts, and compare major cities worldwide.</div>
+      <div class="air-subtitle">Explore global air-quality forecasts, review hourly and daily outlooks, inspect archived trends, audit data quality, build research extracts, and compare major cities worldwide.</div>
     </div>
     """,
     unsafe_allow_html=True,
@@ -2003,6 +2118,229 @@ else:
                     "It is useful for exploring features and preparing a data pipeline, but it must not be used as ground-truth labels "
                     "to claim predictive model accuracy. A later modelling stage will need archived historical observations and a time-based evaluation split."
                 )
+
+            # ============================================================
+            # DAYS 8–9: HISTORICAL MODELLED AIR-QUALITY EXPLORER
+            # Explicitly loaded so the archive request does not run on every
+            # unrelated Streamlit rerun. Results are tied to selected coords.
+            # ============================================================
+            st.markdown("---")
+            st.markdown('<div class="air-section-label">HISTORICAL EXPLORER</div>', unsafe_allow_html=True)
+            st.markdown("### Explore recent air-quality history")
+            st.caption(
+                "Load 7, 30, 60 or 90 days of archived air-quality model output. "
+                "The archive is useful for pattern exploration, but it is not a set of independent ground-monitor observations."
+            )
+
+            history_period_key = (
+                round(float(selected_place["latitude"]), 4),
+                round(float(selected_place["longitude"]), 4),
+                selected_timezone,
+            )
+            with st.form("historical_air_quality_form"):
+                history_days_choice = st.selectbox(
+                    "Historical period",
+                    options=[7, 30, 60, 90],
+                    index=1,
+                    format_func=lambda value: f"Previous {value} days",
+                    key="historical_days_choice_day8_9",
+                )
+                load_history_clicked = st.form_submit_button("Load historical analysis")
+
+            if load_history_clicked:
+                try:
+                    with st.spinner(f"Loading the previous {history_days_choice} days of archived air-quality data..."):
+                        fetched_history = fetch_historical_air_quality(
+                            float(selected_place["latitude"]),
+                            float(selected_place["longitude"]),
+                            selected_timezone,
+                            int(history_days_choice),
+                        )
+                    st.session_state["airaware_history_frame"] = fetched_history
+                    st.session_state["airaware_history_key"] = (*history_period_key, int(history_days_choice))
+                    st.session_state["airaware_history_error"] = None
+                except (requests.RequestException, ValueError, KeyError, pd.errors.ParserError) as history_exc:
+                    st.session_state["airaware_history_frame"] = None
+                    st.session_state["airaware_history_key"] = (*history_period_key, int(history_days_choice))
+                    st.session_state["airaware_history_error"] = str(history_exc)
+
+            requested_history_key = (*history_period_key, int(history_days_choice))
+            stored_history_key = st.session_state.get("airaware_history_key")
+            if stored_history_key == requested_history_key:
+                stored_history_error = st.session_state.get("airaware_history_error")
+                stored_history_frame = st.session_state.get("airaware_history_frame")
+                if stored_history_error:
+                    st.warning("Historical data could not be loaded for this location and period.")
+                    with st.expander("Historical data details"):
+                        st.code(str(stored_history_error))
+                elif isinstance(stored_history_frame, pd.DataFrame) and not stored_history_frame.empty:
+                    history_frame = stored_history_frame.copy()
+                    history_frame = history_frame.sort_values("time", kind="stable").drop_duplicates("time", keep="last")
+                    history_daily = summarize_historical_air_quality(history_frame)
+                    history_valid = history_frame.dropna(subset=["us_aqi"]).copy()
+                    history_valid["us_aqi"] = pd.to_numeric(history_valid["us_aqi"], errors="coerce")
+                    history_valid = history_valid.dropna(subset=["us_aqi"])
+
+                    history_metric_cols = st.columns(4)
+                    with history_metric_cols[0]:
+                        st.metric("Archived records", f"{len(history_frame):,}")
+                    with history_metric_cols[1]:
+                        st.metric("Mean archived AQI", format_value(history_valid["us_aqi"].mean(), decimals=0) if not history_valid.empty else "—")
+                    with history_metric_cols[2]:
+                        st.metric("Highest archived AQI", format_value(history_valid["us_aqi"].max(), decimals=0) if not history_valid.empty else "—")
+                    with history_metric_cols[3]:
+                        aqi_coverage_history = (history_frame["us_aqi"].notna().mean() * 100) if len(history_frame) else 0.0
+                        st.metric("AQI availability", f"{aqi_coverage_history:.0f}%")
+
+                    history_start = pd.Timestamp(history_frame["time"].min())
+                    history_end = pd.Timestamp(history_frame["time"].max())
+                    st.caption(
+                        f"Returned local-time range: {history_start.strftime('%d %b %Y %H:%M')} to "
+                        f"{history_end.strftime('%d %b %Y %H:%M')} · typical sample interval: {infer_sample_interval(history_frame)}."
+                    )
+
+                    if not history_daily.empty and history_daily["mean_us_aqi"].notna().any():
+                        trend_left, trend_right = st.columns(2, gap="large")
+                        with trend_left:
+                            st.markdown("##### Daily average AQI and 7-day trend")
+                            historical_trend_fig = go.Figure()
+                            historical_trend_fig.add_trace(go.Scatter(
+                                x=history_daily["date"], y=history_daily["mean_us_aqi"],
+                                mode="lines+markers", name="Daily mean AQI",
+                                line={"color": "#6498C9", "width": 1.8},
+                                marker={"size": 5}, connectgaps=False,
+                            ))
+                            historical_trend_fig.add_trace(go.Scatter(
+                                x=history_daily["date"], y=history_daily["mean_7d_aqi"],
+                                mode="lines", name="7-day moving average",
+                                line={"color": "#28734A", "width": 3}, connectgaps=False,
+                            ))
+                            historical_trend_fig.update_layout(
+                                yaxis_title="Modelled US AQI",
+                                legend={"orientation": "h", "y": 1.12, "x": 0},
+                            )
+                            make_chart_layout(historical_trend_fig, height=330)
+                            st.plotly_chart(historical_trend_fig, use_container_width=True, config={"displaylogo": False})
+
+                        with trend_right:
+                            st.markdown("##### Daily particulate matter")
+                            historical_pm_fig = go.Figure()
+                            historical_pm_fig.add_trace(go.Scatter(
+                                x=history_daily["date"], y=history_daily["mean_pm2_5"],
+                                mode="lines+markers", name="PM2.5",
+                                line={"color": "#28734A", "width": 2.4}, connectgaps=False,
+                            ))
+                            historical_pm_fig.add_trace(go.Scatter(
+                                x=history_daily["date"], y=history_daily["mean_pm10"],
+                                mode="lines+markers", name="PM10",
+                                line={"color": "#6498C9", "width": 2.4}, connectgaps=False,
+                            ))
+                            historical_pm_fig.update_layout(
+                                yaxis_title="Concentration (µg/m³)",
+                                legend={"orientation": "h", "y": 1.12, "x": 0},
+                            )
+                            make_chart_layout(historical_pm_fig, height=330)
+                            st.plotly_chart(historical_pm_fig, use_container_width=True, config={"displaylogo": False})
+
+                        # Day 9: within-period patterns and robust high-day flags.
+                        history_valid["hour"] = pd.to_datetime(history_valid["time"]).dt.hour
+                        history_valid["weekday"] = pd.to_datetime(history_valid["time"]).dt.dayofweek
+                        hour_profile = history_valid.groupby("hour", as_index=False)["us_aqi"].mean()
+                        weekday_profile = history_valid.groupby("weekday", as_index=False)["us_aqi"].mean()
+                        pattern_left, pattern_right = st.columns(2, gap="large")
+                        with pattern_left:
+                            st.markdown("##### Typical AQI by local hour")
+                            hour_fig = go.Figure(go.Bar(
+                                x=hour_profile["hour"], y=hour_profile["us_aqi"],
+                                marker_color="#28734A",
+                                hovertemplate="Hour %{x}:00<br>Mean AQI: %{y:.1f}<extra></extra>",
+                            ))
+                            hour_fig.update_layout(xaxis_title="Local hour", yaxis_title="Mean modelled US AQI", showlegend=False)
+                            make_chart_layout(hour_fig, height=285)
+                            st.plotly_chart(hour_fig, use_container_width=True, config={"displaylogo": False})
+                        with pattern_right:
+                            st.markdown("##### Typical AQI by weekday")
+                            weekday_names = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri", 5: "Sat", 6: "Sun"}
+                            weekday_profile["weekday_name"] = weekday_profile["weekday"].map(weekday_names)
+                            weekday_fig = go.Figure(go.Bar(
+                                x=weekday_profile["weekday_name"], y=weekday_profile["us_aqi"],
+                                marker_color="#6498C9",
+                                hovertemplate="%{x}<br>Mean AQI: %{y:.1f}<extra></extra>",
+                            ))
+                            weekday_fig.update_layout(xaxis_title="Local weekday", yaxis_title="Mean modelled US AQI", showlegend=False)
+                            make_chart_layout(weekday_fig, height=285)
+                            st.plotly_chart(weekday_fig, use_container_width=True, config={"displaylogo": False})
+
+                        valid_daily_history = history_daily.dropna(subset=["mean_us_aqi"]).copy()
+                        if len(valid_daily_history) >= 14:
+                            q1 = float(valid_daily_history["mean_us_aqi"].quantile(0.25))
+                            q3 = float(valid_daily_history["mean_us_aqi"].quantile(0.75))
+                            iqr = q3 - q1
+                            upper_fence = q3 + 1.5 * iqr
+                            unusually_high = valid_daily_history[valid_daily_history["mean_us_aqi"] > upper_fence]
+                            st.markdown("##### Unusually high days within this period")
+                            if not unusually_high.empty:
+                                st.dataframe(
+                                    unusually_high[["date", "mean_us_aqi", "max_us_aqi"]].rename(columns={
+                                        "date": "Local date", "mean_us_aqi": "Daily mean AQI", "max_us_aqi": "Daily maximum AQI"
+                                    }),
+                                    use_container_width=True,
+                                    hide_index=True,
+                                    column_config={
+                                        "Daily mean AQI": st.column_config.NumberColumn(format="%.0f"),
+                                        "Daily maximum AQI": st.column_config.NumberColumn(format="%.0f"),
+                                    },
+                                )
+                                st.caption(
+                                    f"Flagged using the 1.5×IQR upper fence ({upper_fence:.1f}) within this selected period. "
+                                    "These are statistical outliers relative to this dataset, not official health-alert days."
+                                )
+                            else:
+                                st.info("No daily mean exceeded the selected period's 1.5×IQR upper fence.")
+                        else:
+                            st.caption("Outlier screening needs at least 14 days with valid daily AQI averages; choose 30, 60 or 90 days for a more useful comparison.")
+
+                        # Compare the latest seven complete daily summaries with
+                        # the preceding seven; report only when both periods exist.
+                        if len(valid_daily_history) >= 14:
+                            last_seven = valid_daily_history.tail(7)["mean_us_aqi"].mean()
+                            previous_seven = valid_daily_history.iloc[-14:-7]["mean_us_aqi"].mean()
+                            if pd.notna(last_seven) and pd.notna(previous_seven):
+                                delta = float(last_seven - previous_seven)
+                                trend_cols = st.columns(3)
+                                with trend_cols[0]:
+                                    st.metric("Latest 7-day mean AQI", format_value(last_seven, decimals=0))
+                                with trend_cols[1]:
+                                    st.metric("Previous 7-day mean AQI", format_value(previous_seven, decimals=0))
+                                with trend_cols[2]:
+                                    st.metric("Change between periods", f"{delta:+.1f}", help="Positive means the latest period had a higher modelled AQI average. This is descriptive, not a causal explanation.")
+
+                        history_export = history_frame.copy()
+                        history_export["aqi_category"] = history_export["us_aqi"].apply(aqi_category)
+                        history_export = history_export.rename(columns={
+                            "time": "local_timestamp",
+                            "us_aqi": "us_aqi_archived_model_output",
+                            "pm2_5": "pm2_5_ug_m3_model_output",
+                            "pm10": "pm10_ug_m3_model_output",
+                        })
+                        st.download_button(
+                            "Download historical archive (CSV)",
+                            data=history_export.to_csv(index=False).encode("utf-8-sig"),
+                            file_name=f"airaware_{city_slug}_{history_days_choice}d_archived_model_output.csv",
+                            mime="text/csv",
+                            key="download_historical_archive_day8_9",
+                        )
+                        st.caption(
+                            "Research limitation: this is archived atmospheric-model output supplied by the Air Quality API, "
+                            "not independent ground-monitor observations. Use it for exploratory model-output patterns, "
+                            "not as verified ground truth for evaluating a new AQI prediction model."
+                        )
+                    else:
+                        st.info("Historical records were returned, but no valid AQI values were available for the selected period.")
+                else:
+                    st.info("No historical archive has been loaded for this location and period yet. Choose a period and select Load historical analysis.")
+            else:
+                st.info("Choose a historical period and select Load historical analysis to retrieve archived data. The request is made only when you press the button.")
 
         else:
             st.info("The city was selected, but hourly air-quality forecast data is temporarily unavailable.")
