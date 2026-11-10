@@ -609,11 +609,12 @@ def fetch_hourly_air(latitude: float, longitude: float, timezone_name: str) -> p
     if "time" not in frame.columns:
         raise ValueError("The air-quality response did not include timestamps.")
     frame["time"] = pd.to_datetime(frame["time"], errors="coerce")
-    frame = frame.dropna(subset=["time"]).sort_values("time", kind="stable").reset_index(drop=True)
+    frame = frame.dropna(subset=["time"]).sort_values("time", kind="stable")
+    frame = frame.drop_duplicates(subset=["time"], keep="last").reset_index(drop=True)
     for column in ("us_aqi", "pm2_5", "pm10"):
         if column not in frame.columns:
             frame[column] = np.nan
-        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+        frame[column] = pd.to_numeric(frame[column], errors="coerce").replace([np.inf, -np.inf], np.nan)
     return frame
 
 
@@ -657,7 +658,7 @@ def fetch_historical_air_quality(
     for column in ("us_aqi", "pm2_5", "pm10"):
         if column not in frame.columns:
             frame[column] = np.nan
-        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+        frame[column] = pd.to_numeric(frame[column], errors="coerce").replace([np.inf, -np.inf], np.nan)
     frame = frame.drop_duplicates(subset=["time"], keep="last").reset_index(drop=True)
     return frame
 
@@ -681,11 +682,12 @@ def fetch_hourly_weather(latitude: float, longitude: float, timezone_name: str) 
     if "time" not in frame.columns:
         raise ValueError("The weather response did not include timestamps.")
     frame["time"] = pd.to_datetime(frame["time"], errors="coerce")
-    frame = frame.dropna(subset=["time"]).sort_values("time", kind="stable").reset_index(drop=True)
+    frame = frame.dropna(subset=["time"]).sort_values("time", kind="stable")
+    frame = frame.drop_duplicates(subset=["time"], keep="last").reset_index(drop=True)
     for column in ("temperature_2m", "relative_humidity_2m", "wind_speed_10m", "precipitation"):
         if column not in frame.columns:
             frame[column] = np.nan
-        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+        frame[column] = pd.to_numeric(frame[column], errors="coerce").replace([np.inf, -np.inf], np.nan)
     return frame
 
 
@@ -706,11 +708,13 @@ def fetch_weather(latitude: float, longitude: float, timezone_name: str) -> dict
 
 
 def safe_number(value: Any) -> float | None:
+    """Convert a value to a finite float; treat NaN and infinities as missing."""
     try:
         if value is None or pd.isna(value):
             return None
-        return float(value)
-    except (TypeError, ValueError):
+        number = float(value)
+        return number if math.isfinite(number) else None
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -756,7 +760,7 @@ def aggregate_daily_forecast(frame: pd.DataFrame, today: Any = None) -> pd.DataF
     working = frame.copy()
     working["time"] = pd.to_datetime(working["time"], errors="coerce")
     for column in ("us_aqi", "pm2_5", "pm10"):
-        working[column] = pd.to_numeric(working[column], errors="coerce")
+        working[column] = pd.to_numeric(working[column], errors="coerce").replace([np.inf, -np.inf], np.nan)
     working = working.dropna(subset=["time"]).sort_values("time")
     working = working.drop_duplicates(subset=["time"], keep="last")
     if working.empty:
@@ -797,7 +801,7 @@ def summarize_historical_air_quality(frame: pd.DataFrame) -> pd.DataFrame:
     for column in ("us_aqi", "pm2_5", "pm10"):
         if column not in working.columns:
             working[column] = np.nan
-        working[column] = pd.to_numeric(working[column], errors="coerce")
+        working[column] = pd.to_numeric(working[column], errors="coerce").replace([np.inf, -np.inf], np.nan)
     working["date"] = working["time"].dt.date
     summary = (
         working.groupby("date", as_index=False, sort=True)
@@ -834,6 +838,159 @@ def infer_sample_interval(frame: pd.DataFrame) -> str:
     return f"About {median_minutes:.0f} minutes"
 
 
+def detect_elevated_aqi_episodes(
+    frame: pd.DataFrame,
+    threshold: float = 101.0,
+    min_samples: int = 3,
+) -> tuple[pd.DataFrame, str]:
+    """Find runs of elevated archived AQI samples without bridging time gaps.
+
+    The detector uses the modal positive timestamp interval in the supplied
+    archive (which may be hourly or multi-hourly depending on model coverage).
+    It reports sample runs, not official pollution alerts or observed exposure.
+    """
+    columns = [
+        "start_time", "end_time", "samples", "sample_interval",
+        "observed_span_hours", "mean_us_aqi", "peak_us_aqi",
+        "peak_pm2_5", "peak_pm10",
+    ]
+    if frame is None or frame.empty or not {"time", "us_aqi"}.issubset(frame.columns):
+        return pd.DataFrame(columns=columns), "Unavailable"
+
+    working = frame.copy()
+    working["time"] = pd.to_datetime(working["time"], errors="coerce")
+    working["us_aqi"] = pd.to_numeric(working["us_aqi"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    for column in ("pm2_5", "pm10"):
+        if column not in working.columns:
+            working[column] = np.nan
+        working[column] = pd.to_numeric(working[column], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    working = working.dropna(subset=["time", "us_aqi"]).sort_values("time", kind="stable")
+    working = working.drop_duplicates(subset=["time"], keep="last").reset_index(drop=True)
+    working = working[(working["us_aqi"] >= 0) & (working["us_aqi"] <= 500)].copy()
+    if len(working) < int(min_samples):
+        return pd.DataFrame(columns=columns), "Not enough valid samples"
+
+    deltas = working["time"].diff().dropna()
+    deltas = deltas[deltas > pd.Timedelta(0)]
+    if deltas.empty:
+        return pd.DataFrame(columns=columns), "Not enough distinct timestamps"
+    modal_interval = deltas.value_counts().index[0]
+    cadence_label = (
+        f"{modal_interval.total_seconds() / 3600:g} hour(s)"
+        if modal_interval.total_seconds() % 3600 == 0
+        else f"{modal_interval.total_seconds() / 60:g} minute(s)"
+    )
+
+    episodes: list[dict[str, Any]] = []
+    current_rows: list[dict[str, Any]] = []
+
+    def close_episode(rows: list[dict[str, Any]]) -> None:
+        if len(rows) < int(min_samples):
+            return
+        segment = pd.DataFrame(rows)
+        start = pd.Timestamp(segment["time"].iloc[0])
+        end = pd.Timestamp(segment["time"].iloc[-1])
+        episodes.append({
+            "start_time": start,
+            "end_time": end,
+            "samples": int(len(segment)),
+            "sample_interval": cadence_label,
+            "observed_span_hours": float((end - start).total_seconds() / 3600.0),
+            "mean_us_aqi": float(segment["us_aqi"].mean()),
+            "peak_us_aqi": float(segment["us_aqi"].max()),
+            "peak_pm2_5": safe_number(segment["pm2_5"].max()),
+            "peak_pm10": safe_number(segment["pm10"].max()),
+        })
+
+    previous_time = None
+    for row in working.to_dict(orient="records"):
+        timestamp = pd.Timestamp(row["time"])
+        value = float(row["us_aqi"])
+        is_elevated = value >= float(threshold)
+        is_contiguous = previous_time is not None and timestamp - previous_time == modal_interval
+        if not is_elevated:
+            close_episode(current_rows)
+            current_rows = []
+        elif current_rows and not is_contiguous:
+            close_episode(current_rows)
+            current_rows = [row]
+        elif is_elevated:
+            current_rows.append(row)
+        previous_time = timestamp
+
+    close_episode(current_rows)
+    result = pd.DataFrame(episodes, columns=columns)
+    if not result.empty:
+        result = result.sort_values(["start_time", "peak_us_aqi"], ascending=[True, False]).reset_index(drop=True)
+    return result, cadence_label
+
+
+def build_historical_analysis_note(
+    *,
+    city: str,
+    region: str,
+    country: str,
+    period_days: int,
+    frame: pd.DataFrame,
+    episodes: pd.DataFrame,
+    threshold: float,
+    minimum_samples: int,
+    cadence_label: str,
+) -> str:
+    """Create a small reproducible Markdown note for a historical analysis."""
+    clean = frame.copy() if frame is not None else pd.DataFrame()
+    if not clean.empty:
+        clean["time"] = pd.to_datetime(clean["time"], errors="coerce")
+        if "us_aqi" not in clean.columns:
+            clean["us_aqi"] = np.nan
+        clean["us_aqi"] = pd.to_numeric(clean["us_aqi"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        clean = clean.dropna(subset=["time"]).sort_values("time")
+    valid_aqi = clean["us_aqi"].dropna() if "us_aqi" in clean else pd.Series(dtype=float)
+    start = clean["time"].min() if not clean.empty else None
+    end = clean["time"].max() if not clean.empty else None
+    aqi_coverage = float(valid_aqi.notna().sum() / len(clean) * 100.0) if len(clean) else 0.0
+    mean_aqi = float(valid_aqi.mean()) if not valid_aqi.empty else None
+    peak_aqi = float(valid_aqi.max()) if not valid_aqi.empty else None
+    lines = [
+        "# AirAware historical analysis note",
+        "",
+        f"- Location: {city}, {region}, {country}",
+        f"- Requested period: previous {period_days} days",
+        f"- Returned local-time range: {start if start is not None else 'unavailable'} to {end if end is not None else 'unavailable'}",
+        f"- Returned records: {len(clean)}",
+        f"- AQI records: {len(valid_aqi)}",
+        f"- AQI availability: {aqi_coverage:.1f}%",
+        f"- Typical sample cadence: {cadence_label}",
+        f"- Mean modelled US AQI: {mean_aqi:.1f}" if mean_aqi is not None else "- Mean modelled US AQI: unavailable",
+        f"- Peak modelled US AQI: {peak_aqi:.1f}" if peak_aqi is not None else "- Peak modelled US AQI: unavailable",
+        "",
+        "## Elevated-sample run method",
+        f"- Threshold: US AQI >= {threshold:.0f}",
+        f"- Minimum consecutive samples: {minimum_samples}",
+        f"- Detected runs: {len(episodes)}",
+        "",
+        "## Interpretation and limitations",
+        "This analysis uses archived atmospheric-model output provided by Open-Meteo's Air Quality API. It is not a set of independent ground-monitor observations.",
+        "The detector groups consecutive available samples using the modal timestamp interval in this returned dataset. It breaks a run at missing or irregular intervals.",
+        "Detected runs are exploratory statistical summaries, not official pollution alerts, verified exposure periods, or medical guidance.",
+        "For predictive-model validation, compare predictions against independent observations or a clearly defined benchmark dataset, not the same archived model output used as features.",
+        "",
+        "## Data source",
+        "Open-Meteo Air Quality API: https://open-meteo.com/en/docs/air-quality-api",
+        "",
+    ]
+    if not episodes.empty:
+        lines.extend(["## Detected runs", "", "| Start | End | Samples | Mean AQI | Peak AQI |", "|---|---|---:|---:|---:|"])
+        for item in episodes.itertuples(index=False):
+            lines.append(
+                f"| {item.start_time} | {item.end_time} | {item.samples} | {item.mean_us_aqi:.1f} | {item.peak_us_aqi:.1f} |"
+            )
+        lines.append("")
+    else:
+        lines.extend(["No runs met the selected threshold and minimum-sample settings.", ""])
+    return "\n".join(lines)
+
+
 def audit_forecast_data(frame: pd.DataFrame) -> dict[str, Any]:
     """Summarise completeness and timestamp consistency without changing data."""
     if frame is None or frame.empty or "time" not in frame.columns:
@@ -863,20 +1020,30 @@ def audit_forecast_data(frame: pd.DataFrame) -> dict[str, Any]:
             approximate_hours = int(round(delta / pd.Timedelta(hours=1)))
             missing_hour_intervals += max(approximate_hours - 1, 0)
 
+    def numeric_series(column: str) -> pd.Series:
+        if column not in working.columns:
+            return pd.Series(np.nan, index=working.index, dtype=float)
+        return pd.to_numeric(working[column], errors="coerce")
+
     def coverage(column: str) -> float:
         if rows == 0 or column not in working.columns:
             return 0.0
-        numeric = pd.to_numeric(working[column], errors="coerce")
-        return float(numeric.notna().sum() / rows * 100.0)
+        numeric = numeric_series(column)
+        finite = numeric.notna() & np.isfinite(numeric)
+        return float(finite.sum() / rows * 100.0)
 
     invalid_values = 0
     if "us_aqi" in working.columns:
-        aqi_values = pd.to_numeric(working["us_aqi"], errors="coerce")
-        invalid_values += int(((aqi_values < 0) | (aqi_values > 500)).sum())
+        aqi_values = numeric_series("us_aqi")
+        finite_aqi = aqi_values.notna() & np.isfinite(aqi_values)
+        invalid_values += int(np.isinf(aqi_values).sum())
+        invalid_values += int((finite_aqi & ((aqi_values < 0) | (aqi_values > 500))).sum())
     for column in ("pm2_5", "pm10"):
         if column in working.columns:
-            pollutant_values = pd.to_numeric(working[column], errors="coerce")
-            invalid_values += int((pollutant_values < 0).sum())
+            pollutant_values = numeric_series(column)
+            finite_pollutant = pollutant_values.notna() & np.isfinite(pollutant_values)
+            invalid_values += int(np.isinf(pollutant_values).sum())
+            invalid_values += int((finite_pollutant & (pollutant_values < 0)).sum())
 
     continuity_pct = float(exact_hourly.mean() * 100.0) if len(intervals) else 100.0
     return {
@@ -908,7 +1075,7 @@ def consecutive_hour_changes(frame: pd.DataFrame, value_column: str) -> pd.Serie
     working = frame[["time", value_column]].copy()
     working["_source_index"] = frame.index
     working["time"] = pd.to_datetime(working["time"], errors="coerce")
-    working[value_column] = pd.to_numeric(working[value_column], errors="coerce")
+    working[value_column] = pd.to_numeric(working[value_column], errors="coerce").replace([np.inf, -np.inf], np.nan)
     working = working.dropna(subset=["time"]).sort_values("time", kind="stable")
     working = working.drop_duplicates(subset=["time"], keep="last")
 
@@ -926,7 +1093,7 @@ def find_best_contiguous_window(frame: pd.DataFrame, window_size: int = 6) -> di
         return None
     working = frame[["time", "us_aqi"]].copy()
     working["time"] = pd.to_datetime(working["time"], errors="coerce")
-    working["us_aqi"] = pd.to_numeric(working["us_aqi"], errors="coerce")
+    working["us_aqi"] = pd.to_numeric(working["us_aqi"], errors="coerce").replace([np.inf, -np.inf], np.nan)
     working = working.dropna(subset=["time", "us_aqi"]).sort_values("time")
     working = working.drop_duplicates(subset=["time"], keep="last").reset_index(drop=True)
     if len(working) < window_size:
@@ -973,7 +1140,7 @@ def build_research_dataset(
     for column in ("us_aqi", "pm2_5", "pm10"):
         if column not in air.columns:
             air[column] = np.nan
-        air[column] = pd.to_numeric(air[column], errors="coerce")
+        air[column] = pd.to_numeric(air[column], errors="coerce").replace([np.inf, -np.inf], np.nan)
 
     weather_columns = [
         "temperature_2m", "relative_humidity_2m", "wind_speed_10m", "precipitation"
@@ -987,7 +1154,7 @@ def build_research_dataset(
         for column in weather_columns:
             if column not in weather.columns:
                 weather[column] = np.nan
-            weather[column] = pd.to_numeric(weather[column], errors="coerce")
+            weather[column] = pd.to_numeric(weather[column], errors="coerce").replace([np.inf, -np.inf], np.nan)
         weather = weather[["time", *weather_columns]]
 
     result = air.merge(weather, on="time", how="left", validate="one_to_one")
@@ -1329,7 +1496,7 @@ st.markdown(
     <div class="air-hero">
       <div class="air-eyebrow">Global environmental intelligence</div>
       <div class="air-title">Understand the air around you.</div>
-      <div class="air-subtitle">Explore global air-quality forecasts, review hourly and daily outlooks, inspect archived trends, audit data quality, build research extracts, and compare major cities worldwide.</div>
+      <div class="air-subtitle">Explore global air-quality forecasts, review hourly and daily outlooks, inspect archived trends, identify elevated pollution episodes, audit data quality, build research extracts, and compare major cities worldwide.</div>
     </div>
     """,
     unsafe_allow_html=True,
@@ -2300,20 +2467,127 @@ else:
                         else:
                             st.caption("Outlier screening needs at least 14 days with valid daily AQI averages; choose 30, 60 or 90 days for a more useful comparison.")
 
-                        # Compare the latest seven complete daily summaries with
-                        # the preceding seven; report only when both periods exist.
-                        if len(valid_daily_history) >= 14:
-                            last_seven = valid_daily_history.tail(7)["mean_us_aqi"].mean()
-                            previous_seven = valid_daily_history.iloc[-14:-7]["mean_us_aqi"].mean()
-                            if pd.notna(last_seven) and pd.notna(previous_seven):
+                        # Compare two actual seven-calendar-day windows. The older
+                        # implementation compared the latest 7 valid rows, which
+                        # could span more than 7 calendar days when data was missing.
+                        if not valid_daily_history.empty:
+                            latest_date = pd.Timestamp(valid_daily_history["date"].max()).date()
+                            latest_start = latest_date - pd.Timedelta(days=6)
+                            previous_end = latest_start - pd.Timedelta(days=1)
+                            previous_start = previous_end - pd.Timedelta(days=6)
+                            latest_window = valid_daily_history[
+                                (valid_daily_history["date"] >= latest_start)
+                                & (valid_daily_history["date"] <= latest_date)
+                            ]
+                            previous_window = valid_daily_history[
+                                (valid_daily_history["date"] >= previous_start)
+                                & (valid_daily_history["date"] <= previous_end)
+                            ]
+                            if len(latest_window) >= 4 and len(previous_window) >= 4:
+                                last_seven = float(latest_window["mean_us_aqi"].mean())
+                                previous_seven = float(previous_window["mean_us_aqi"].mean())
                                 delta = float(last_seven - previous_seven)
                                 trend_cols = st.columns(3)
                                 with trend_cols[0]:
-                                    st.metric("Latest 7-day mean AQI", format_value(last_seven, decimals=0))
+                                    st.metric("Latest 7-calendar-day mean", format_value(last_seven, decimals=0), help=f"Based on {len(latest_window)} days with valid AQI values in {latest_start} to {latest_date}.")
                                 with trend_cols[1]:
-                                    st.metric("Previous 7-day mean AQI", format_value(previous_seven, decimals=0))
+                                    st.metric("Previous 7-calendar-day mean", format_value(previous_seven, decimals=0), help=f"Based on {len(previous_window)} days with valid AQI values in {previous_start} to {previous_end}.")
                                 with trend_cols[2]:
-                                    st.metric("Change between periods", f"{delta:+.1f}", help="Positive means the latest period had a higher modelled AQI average. This is descriptive, not a causal explanation.")
+                                    st.metric("Change between periods", f"{delta:+.1f}", help="Positive means the latest calendar window had a higher modelled AQI average. This is descriptive, not a causal explanation.")
+                            else:
+                                st.caption("The 7-day comparison needs at least four valid daily AQI averages in each of the two calendar windows.")
+
+                        # Day 10: identify consecutive elevated-AQI sample runs.
+                        st.markdown("##### Elevated AQI episode detector")
+                        st.caption(
+                            "Find uninterrupted runs of archived model samples above a chosen threshold. "
+                            "The detector adapts to the archive's typical sample interval and never bridges missing timestamps."
+                        )
+                        episode_controls = st.columns(2, gap="large")
+                        with episode_controls[0]:
+                            episode_threshold = st.slider(
+                                "Modelled US AQI threshold", min_value=51, max_value=301,
+                                value=101, step=10, key="episode_threshold_day10",
+                                help="A statistical threshold for exploring this archive, not an official alert setting."
+                            )
+                        with episode_controls[1]:
+                            episode_min_samples = st.slider(
+                                "Minimum consecutive samples", min_value=2, max_value=12,
+                                value=3, step=1, key="episode_min_samples_day10",
+                                help="Uses the typical timestamp interval reported for this archived dataset."
+                            )
+
+                        episode_frame, episode_cadence = detect_elevated_aqi_episodes(
+                            history_frame, threshold=float(episode_threshold),
+                            min_samples=int(episode_min_samples),
+                        )
+                        episode_metric_cols = st.columns(3)
+                        with episode_metric_cols[0]:
+                            st.metric("Detected runs", len(episode_frame))
+                        with episode_metric_cols[1]:
+                            st.metric("Typical sample interval", episode_cadence)
+                        with episode_metric_cols[2]:
+                            peak_episode = (
+                                format_value(episode_frame["peak_us_aqi"].max(), decimals=0)
+                                if not episode_frame.empty else "—"
+                            )
+                            st.metric("Highest run peak", peak_episode)
+
+                        if episode_frame.empty:
+                            st.info("No uninterrupted runs met the current threshold and minimum-sample settings. This can also happen when the archive has sparse or missing timestamps.")
+                        else:
+                            episode_display = episode_frame.rename(columns={
+                                "start_time": "Start (local)",
+                                "end_time": "End (local)",
+                                "samples": "Samples",
+                                "sample_interval": "Sample interval",
+                                "observed_span_hours": "Span between samples (hours)",
+                                "mean_us_aqi": "Mean AQI",
+                                "peak_us_aqi": "Peak AQI",
+                                "peak_pm2_5": "Peak PM2.5 (µg/m³)",
+                                "peak_pm10": "Peak PM10 (µg/m³)",
+                            })
+                            st.dataframe(
+                                episode_display, use_container_width=True, hide_index=True,
+                                column_config={
+                                    "Mean AQI": st.column_config.NumberColumn(format="%.1f"),
+                                    "Peak AQI": st.column_config.NumberColumn(format="%.0f"),
+                                    "Peak PM2.5 (µg/m³)": st.column_config.NumberColumn(format="%.1f"),
+                                    "Peak PM10 (µg/m³)": st.column_config.NumberColumn(format="%.1f"),
+                                    "Span between samples (hours)": st.column_config.NumberColumn(format="%.1f"),
+                                },
+                            )
+                            st.download_button(
+                                "Download elevated-AQI runs (CSV)",
+                                data=episode_frame.to_csv(index=False).encode("utf-8-sig"),
+                                file_name=f"airaware_{city_slug}_elevated_aqi_runs.csv",
+                                mime="text/csv",
+                                key="download_elevated_aqi_runs_day10",
+                            )
+                        st.caption(
+                            f"Method: US AQI ≥ {episode_threshold}, at least {episode_min_samples} consecutive samples, "
+                            f"with the archive's modal interval ({episode_cadence}). These are exploratory archived-model runs, "
+                            "not official health alerts, verified exposure periods, or medical guidance."
+                        )
+
+                        analysis_note = build_historical_analysis_note(
+                            city=selected_name,
+                            region=selected_region_for_data,
+                            country=selected_country_for_data,
+                            period_days=int(history_days_choice),
+                            frame=history_frame,
+                            episodes=episode_frame,
+                            threshold=float(episode_threshold),
+                            minimum_samples=int(episode_min_samples),
+                            cadence_label=episode_cadence,
+                        )
+                        st.download_button(
+                            "Download historical analysis note (Markdown)",
+                            data=analysis_note.encode("utf-8"),
+                            file_name=f"airaware_{city_slug}_{history_days_choice}d_analysis_note.md",
+                            mime="text/markdown",
+                            key="download_historical_analysis_note_day10",
+                        )
 
                         history_export = history_frame.copy()
                         history_export["aqi_category"] = history_export["us_aqi"].apply(aqi_category)
