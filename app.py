@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import html
+import io
 import math
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
@@ -16,7 +18,7 @@ from branca.element import Element
 from folium.raster_layers import ImageOverlay
 
 # ============================================================
-# AIR AWARE — GLOBAL ENVIRONMENTAL INTELLIGENCE
+# AIR AWARE — GLOBAL ENVIRONMENTAL INTELLIGENCE | RELEASE CANDIDATE
 # ============================================================
 
 st.set_page_config(
@@ -348,9 +350,79 @@ st.markdown(
 # Includes cities generally above 15,000 residents plus capitals.
 # ============================================================
 
+RETRYABLE_HTTP_STATUS = {408, 425, 429, 500, 502, 503, 504}
+
+
+def request_with_retry(
+    url: str,
+    *,
+    params: dict[str, Any] | None = None,
+    timeout: int = 30,
+    attempts: int = 3,
+) -> requests.Response:
+    """GET with bounded retries for transient network and server failures."""
+    attempts = max(1, int(attempts))
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            response = requests.get(url, params=params, timeout=(8, int(timeout)))
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            last_error = exc
+            if attempt >= attempts - 1:
+                raise
+            time.sleep(min(0.5 * (2 ** attempt), 2.0))
+            continue
+
+        if response.status_code in RETRYABLE_HTTP_STATUS and attempt < attempts - 1:
+            retry_after = response.headers.get("Retry-After", "")
+            try:
+                delay = float(retry_after)
+            except (TypeError, ValueError):
+                delay = 0.5 * (2 ** attempt)
+            time.sleep(min(max(delay, 0.25), 2.5))
+            continue
+
+        response.raise_for_status()
+        return response
+
+    if last_error is not None:
+        raise last_error
+    raise requests.RequestException("The request could not be completed after retries.")
+
+
+def request_json(
+    url: str,
+    *,
+    params: dict[str, Any] | None = None,
+    timeout: int = 30,
+    attempts: int = 3,
+) -> Any:
+    """Request JSON and turn API-level error objects into readable exceptions."""
+    response = request_with_retry(url, params=params, timeout=timeout, attempts=attempts)
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise ValueError("The data service returned an invalid JSON response.") from exc
+    if isinstance(payload, dict) and payload.get("error"):
+        message = payload.get("reason") or payload.get("message") or "The data service reported an error."
+        raise ValueError(str(message))
+    return payload
+
+
+def safe_timezone_name(value: Any) -> str:
+    """Return an API timezone that pandas can use, falling back to UTC."""
+    candidate = str(value or TIMEZONE_DEFAULT).strip() or TIMEZONE_DEFAULT
+    try:
+        pd.Timestamp.now(tz=candidate)
+        return candidate
+    except (TypeError, ValueError, KeyError):
+        return TIMEZONE_DEFAULT
+
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def load_city_catalog() -> pd.DataFrame:
-    catalog = pd.read_csv(CITY_DATA_URL, keep_default_na=False)
+    catalog_response = request_with_retry(CITY_DATA_URL, timeout=35)
+    catalog = pd.read_csv(io.StringIO(catalog_response.text), keep_default_na=False)
     required = {"name", "country", "subcountry", "geonameid"}
     if not required.issubset(catalog.columns):
         raise ValueError("The global city dataset has an unexpected format.")
@@ -384,13 +456,13 @@ def geocode_catalog_city(city_name: str, country_name: str, region_name: str, ge
     country_code = country_code_for_name(country_name)
     if not country_code:
         return None
-    response = requests.get(
+    payload = request_json(
         GEOCODING_URL,
         params={"name": city_name, "count": 100, "language": "en", "countryCode": country_code},
         timeout=25,
     )
-    response.raise_for_status()
-    results = response.json().get("results", []) or []
+    results = payload.get("results", []) if isinstance(payload, dict) else []
+    results = results or []
     if not results:
         return None
 
@@ -566,13 +638,16 @@ def fetch_current_batch(points: tuple[tuple[float, float], ...]) -> pd.DataFrame
         "current": "us_aqi,pm2_5,pm10",
         "cell_selection": "nearest",
     }
-    response = requests.get(AIR_URL, params=params, timeout=40)
-    response.raise_for_status()
-    payload = response.json()
+    payload = request_json(AIR_URL, params=params, timeout=40)
     if isinstance(payload, dict):
         payload = [payload]
     if not isinstance(payload, list):
         raise ValueError("Unexpected air-quality API response format.")
+    if len(payload) != len(points):
+        raise ValueError(
+            "The multi-location API response did not contain one result per requested coordinate. "
+            "This batch has been marked unavailable to avoid mismatching city data."
+        )
     rows = []
     for index, (requested_lat, requested_lon) in enumerate(points):
         item = payload[index] if index < len(payload) and isinstance(payload[index], dict) else {}
@@ -597,12 +672,10 @@ def fetch_hourly_air(latitude: float, longitude: float, timezone_name: str) -> p
         "longitude": float(longitude),
         "hourly": "us_aqi,pm2_5,pm10",
         "forecast_days": 5,
-        "timezone": timezone_name or TIMEZONE_DEFAULT,
+        "timezone": safe_timezone_name(timezone_name),
         "cell_selection": "land",
     }
-    response = requests.get(AIR_URL, params=params, timeout=30)
-    response.raise_for_status()
-    payload = response.json()
+    payload = request_json(AIR_URL, params=params, timeout=30)
     if "hourly" not in payload or "time" not in payload["hourly"]:
         raise ValueError("Unexpected hourly air-quality response.")
     frame = pd.DataFrame(payload["hourly"])
@@ -640,12 +713,10 @@ def fetch_historical_air_quality(
         "hourly": "us_aqi,pm2_5,pm10",
         "past_days": days,
         "forecast_days": 0,
-        "timezone": timezone_name or TIMEZONE_DEFAULT,
+        "timezone": safe_timezone_name(timezone_name),
         "cell_selection": "land",
     }
-    response = requests.get(AIR_URL, params=params, timeout=45)
-    response.raise_for_status()
-    payload = response.json()
+    payload = request_json(AIR_URL, params=params, timeout=45)
     if "hourly" not in payload or "time" not in payload["hourly"]:
         message = payload.get("reason") or payload.get("error") or "Unexpected historical air-quality response."
         raise ValueError(str(message))
@@ -671,11 +742,9 @@ def fetch_hourly_weather(latitude: float, longitude: float, timezone_name: str) 
         "longitude": float(longitude),
         "hourly": "temperature_2m,relative_humidity_2m,wind_speed_10m,precipitation",
         "forecast_days": 5,
-        "timezone": timezone_name or TIMEZONE_DEFAULT,
+        "timezone": safe_timezone_name(timezone_name),
     }
-    response = requests.get(WEATHER_URL, params=params, timeout=30)
-    response.raise_for_status()
-    payload = response.json()
+    payload = request_json(WEATHER_URL, params=params, timeout=30)
     if "hourly" not in payload or "time" not in payload["hourly"]:
         raise ValueError("Unexpected hourly weather response.")
     frame = pd.DataFrame(payload["hourly"])
@@ -697,20 +766,21 @@ def fetch_weather(latitude: float, longitude: float, timezone_name: str) -> dict
         "latitude": float(latitude),
         "longitude": float(longitude),
         "current": "temperature_2m,relative_humidity_2m,apparent_temperature,wind_speed_10m",
-        "timezone": timezone_name or TIMEZONE_DEFAULT,
+        "timezone": safe_timezone_name(timezone_name),
     }
-    response = requests.get(WEATHER_URL, params=params, timeout=30)
-    response.raise_for_status()
-    payload = response.json()
+    payload = request_json(WEATHER_URL, params=params, timeout=30)
     if "current" not in payload:
         raise ValueError("Unexpected weather response.")
     return payload["current"]
 
 
 def safe_number(value: Any) -> float | None:
-    """Convert a value to a finite float; treat NaN and infinities as missing."""
+    """Convert a scalar to a finite float; treat missing and non-finite values as unavailable."""
     try:
-        if value is None or pd.isna(value):
+        if value is None:
+            return None
+        missing = pd.isna(value)
+        if isinstance(missing, (bool, np.bool_)) and bool(missing):
             return None
         number = float(value)
         return number if math.isfinite(number) else None
@@ -1045,7 +1115,7 @@ def audit_forecast_data(frame: pd.DataFrame) -> dict[str, Any]:
             invalid_values += int(np.isinf(pollutant_values).sum())
             invalid_values += int((finite_pollutant & (pollutant_values < 0)).sum())
 
-    continuity_pct = float(exact_hourly.mean() * 100.0) if len(intervals) else 100.0
+    continuity_pct = float(exact_hourly.mean() * 100.0) if len(intervals) else 0.0
     return {
         "rows": rows,
         "unique_timestamps": int(len(unique_times)),
@@ -1064,16 +1134,17 @@ def audit_forecast_data(frame: pd.DataFrame) -> dict[str, Any]:
 def consecutive_hour_changes(frame: pd.DataFrame, value_column: str) -> pd.Series:
     """Return row-aligned changes only across exact one-hour intervals.
 
-    The returned Series always uses the input frame's index. This matters after
-    merges/sorts: it prevents a calculated change from being attached to a
-    different timestamp when rows are not in their original order.
+    Results are mapped by row position, not index label, so duplicate or
+    non-monotonic DataFrame indexes cannot attach a change to the wrong row.
+    The earlier row of a duplicate timestamp is left unavailable.
     """
     if frame is None or frame.empty or not {"time", value_column}.issubset(frame.columns):
-        return pd.Series(index=getattr(frame, "index", []), dtype=float)
+        index = getattr(frame, "index", pd.RangeIndex(0))
+        return pd.Series(np.nan, index=index, dtype=float)
 
-    output = pd.Series(np.nan, index=frame.index, dtype=float)
+    values = np.full(len(frame), np.nan, dtype=float)
     working = frame[["time", value_column]].copy()
-    working["_source_index"] = frame.index
+    working["_source_position"] = np.arange(len(frame), dtype=int)
     working["time"] = pd.to_datetime(working["time"], errors="coerce")
     working[value_column] = pd.to_numeric(working[value_column], errors="coerce").replace([np.inf, -np.inf], np.nan)
     working = working.dropna(subset=["time"]).sort_values("time", kind="stable")
@@ -1082,9 +1153,9 @@ def consecutive_hour_changes(frame: pd.DataFrame, value_column: str) -> pd.Serie
     time_steps = working["time"].diff()
     value_steps = working[value_column].diff()
     changes = value_steps.where(time_steps.eq(pd.Timedelta(hours=1)))
-    source_indices = working["_source_index"].tolist()
-    output.loc[source_indices] = changes.to_numpy(dtype=float)
-    return output
+    positions = working["_source_position"].to_numpy(dtype=int)
+    values[positions] = changes.to_numpy(dtype=float)
+    return pd.Series(values, index=frame.index, dtype=float)
 
 
 def find_best_contiguous_window(frame: pd.DataFrame, window_size: int = 6) -> dict[str, Any] | None:
@@ -1237,6 +1308,20 @@ def fetch_chunk(points: tuple[tuple[float, float], ...]) -> tuple[pd.DataFrame, 
 
 def collect_samples(points: list[tuple[float, float]], chunk_size: int = 36) -> tuple[pd.DataFrame, int]:
     """Collect multi-location samples while preserving the original point order."""
+    chunk_size = int(chunk_size)
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be at least 1.")
+    normalized_points: list[tuple[float, float]] = []
+    for point in points:
+        if len(point) != 2:
+            raise ValueError("Each map sample must contain latitude and longitude.")
+        latitude, longitude = float(point[0]), float(point[1])
+        if not (math.isfinite(latitude) and math.isfinite(longitude)):
+            continue
+        if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
+            continue
+        normalized_points.append((round(latitude, 4), round(longitude, 4)))
+    points = list(dict.fromkeys(normalized_points))
     chunks = [tuple(points[i:i + chunk_size]) for i in range(0, len(points), chunk_size)]
     if not chunks:
         return pd.DataFrame(columns=["latitude", "longitude", "requested_latitude", "requested_longitude", "us_aqi", "pm2_5", "pm10", "time"]), 0
@@ -1278,14 +1363,32 @@ def interpolate_raster(
     """
     if frame is None or frame.empty:
         return None
+    try:
+        width, height = int(width), int(height)
+        west, south, east, north = (float(value) for value in bounds)
+        smoothing_km = float(smoothing_km)
+    except (TypeError, ValueError):
+        return None
+    if width < 2 or height < 2 or not all(map(math.isfinite, (west, south, east, north, smoothing_km))):
+        return None
+    if east <= west or north <= south or smoothing_km <= 0:
+        return None
     valid = frame.copy()
+    if not {"latitude", "longitude", "us_aqi"}.issubset(valid.columns):
+        return None
     for column in ("latitude", "longitude", "us_aqi"):
         valid[column] = pd.to_numeric(valid[column], errors="coerce")
     valid = valid.dropna(subset=["latitude", "longitude", "us_aqi"])
+    finite_mask = np.isfinite(valid[["latitude", "longitude", "us_aqi"]].to_numpy(dtype=float)).all(axis=1)
+    valid = valid.loc[finite_mask].copy()
+    valid = valid[
+        valid["latitude"].between(-90, 90)
+        & valid["longitude"].between(-180, 180)
+        & valid["us_aqi"].between(0, 500)
+    ]
     if valid.empty:
         return None
 
-    west, south, east, north = bounds
     longitudes = np.linspace(west, east, width, dtype=np.float32)
     latitudes = np.linspace(north, south, height, dtype=np.float32)
     grid_lon, grid_lat = np.meshgrid(longitudes, latitudes)
@@ -1482,6 +1585,7 @@ def render_comparison_table(frame: pd.DataFrame) -> None:
 if refresh_requested:
     fetch_current_batch.clear()
     fetch_hourly_air.clear()
+    fetch_historical_air_quality.clear()
     fetch_hourly_weather.clear()
     fetch_weather.clear()
     st.rerun()
@@ -1685,7 +1789,7 @@ else:
         st.subheader(selected_name)
         st.caption(f"{selected_region_for_data}, {selected_country_for_data}")
 
-        selected_timezone = str(selected_place.get("timezone") or TIMEZONE_DEFAULT)
+        selected_timezone = safe_timezone_name(selected_place.get("timezone"))
         selected_hourly = pd.DataFrame()
         selected_hourly_weather = pd.DataFrame()
         selected_weather: dict = {}
