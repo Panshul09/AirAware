@@ -1,63 +1,84 @@
-# AirAware — Release Candidate QA Build
+# AirAware — Global Environmental Intelligence
 
-AirAware is a Streamlit application for exploring global modelled air-quality forecasts, weather context, archived atmospheric-model output, and city comparisons.
+AirAware is an educational environmental-data application for exploring modelled air-quality forecasts, archived atmospheric-model output, weather context, and city-level comparisons around the world.
 
-This update is a **feature-freeze and reliability pass**. It does not add a new user-facing feature. It focuses on reducing avoidable API failures, safer data alignment, input validation, and a repeatable local smoke-test suite before public beta preparation.
+> **Important:** AirAware displays atmospheric-model estimates, not verified readings from local ground sensors. Its interpolated heat layer visualises sparse sample locations; it does not represent a direct measurement at every point on the map. AirAware is not an official public-health warning service or a medical assessment.
 
-## What's hardened
+## Features
 
-- Bounded retries for transient HTTP/network failures (timeouts, connection errors, 408/425/429/5xx responses).
-- API-level JSON errors and invalid JSON are converted into readable exceptions.
-- City-directory CSV download now has an explicit timeout and uses the same retry handler.
-- Multi-coordinate API batches are rejected if the returned item count does not match the requested coordinate count, rather than risking city/value mismatches.
-- Invalid or non-finite interpolation samples and invalid raster bounds are rejected safely.
-- Row-aligned hourly changes use row positions, preventing calculations from attaching to the wrong record when indexes are duplicated or unordered.
-- A single timestamp no longer reports 100% interval continuity when there is no interval to assess.
-- Selected API timezones are validated with a UTC fallback.
-- Refresh clears the archived air-quality cache as well as current forecast/weather caches.
+- **Global location selection:** choose a country, first-level region, and city.
+- **Interactive global map:** OpenStreetMap basemap with an interpolated air-quality layer where valid model samples are available.
+- **Hourly and daily forecasts:** explore modelled AQI and particulate-matter trends.
+- **Global city comparison:** compare selected locations with a curated set of representative cities.
+- **Weather context:** view temperature, humidity, wind, and precipitation alongside air-quality information.
+- **Historical explorer:** inspect archived atmospheric-model output over supported periods.
+- **Environmental analysis:** explore descriptive patterns, correlations, elevated-AQI periods, and forecast data quality.
+- **Research exports:** download forecast and analysis tables as CSV.
 
-## Requirements
+## Technology
 
-- Python 3.10 or newer recommended.
-- Internet access for the city directory, geocoding, Open-Meteo data and OpenStreetMap tiles.
-- No personal mapping API key is required for the OpenStreetMap basemap.
+Python · Streamlit · Pandas · NumPy · Plotly · Folium · Requests
 
-## Install on Windows with VS Code
+## Run locally
 
-1. Stop the running Streamlit app with `Ctrl+C`.
-2. Copy `app.py`, `requirements.txt`, `qa_smoke_test.py`, and the `.streamlit` folder into your existing `AirAware` project folder.
-3. Keep the existing `.git` and `.venv` folders. Do not replace either one.
-4. Open a new terminal in the AirAware folder and run:
+Python 3.10 or newer is recommended. An internet connection is needed for the data services, global city directory, and map tiles.
 
-```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe -m streamlit run app.py
+```bash
+python -m venv .venv
 ```
 
-Open the local URL printed by Streamlit, normally `http://localhost:8501`.
-
-## Run the local QA smoke tests
-
-With the AirAware virtual environment active (or using its Python executable), run:
+On Windows PowerShell:
 
 ```powershell
-.\.venv\Scripts\python.exe qa_smoke_test.py
+.\.venv\Scripts\Activate.ps1
 ```
 
-The script tests pure helper functions extracted from `app.py` without importing the Streamlit page (which otherwise starts the app and makes network requests). It checks numeric handling, AQI boundaries, daily aggregation, timestamp alignment, data-quality auditing, contiguous windows, elevated-AQI episodes, research joins, raster generation, map HTML generation, timezone fallback, and request retry behavior.
+On macOS/Linux:
 
-These tests do **not** replace manual browser testing or live API testing.
+```bash
+source .venv/bin/activate
+```
 
-## Data sources and interpretation
+Install the dependencies and start the app:
 
-- Air quality and weather: Open-Meteo APIs; air-quality modelling is based on Copernicus Atmosphere Monitoring Service datasets.
-- City directory: DataHub `world-cities` dataset based on GeoNames.
-- Basemap tiles: OpenStreetMap contributors.
+```bash
+python -m pip install -r requirements.txt
+python -m streamlit run app.py
+```
 
-AirAware's forecasts and archived values are atmospheric-model output, not independent ground-monitor observations. The map heat layer interpolates sparse representative city samples and is a visualization surface, not a measurement at every pixel. Correlations are exploratory associations, not causal findings. Do not use AirAware as an official public-health warning or medical assessment.
+The application opens at the local URL printed by Streamlit, usually `http://localhost:8501`.
 
-Check the upstream providers' current attribution, usage and licensing terms before public deployment. In particular, keep visible OpenStreetMap attribution and observe its tile usage policy.
+## Automated checks
 
-## Release status
+Run the included helper-function smoke tests from the repository root:
 
-This is a local release-candidate QA build. It is not yet a public production release. Before deployment, manually verify the app in a browser, test the external APIs from the deployment environment, inspect mobile layout, confirm attribution, and ensure no secrets or local environment folders are committed.
+```bash
+python qa_smoke_test.py
+```
+
+These checks use synthetic data and do not replace live API, browser, mobile-layout, or deployment testing.
+
+## Data sources and attribution
+
+- **Air quality and weather:** [Open-Meteo](https://open-meteo.com/). Air-quality modelling uses datasets from the [Copernicus Atmosphere Monitoring Service (CAMS)](https://atmosphere.copernicus.eu/).
+- **City directory:** [DataHub world-cities](https://github.com/datasets/world-cities), sourced from [GeoNames](https://www.geonames.org/).
+- **Basemap:** [© OpenStreetMap contributors](https://www.openstreetmap.org/copyright).
+
+See [ATTRIBUTION.md](ATTRIBUTION.md) for source attribution and third-party usage notes. Review the providers' current terms and usage policies before public deployment or any non-personal use. In particular, check Open-Meteo's access terms and OpenStreetMap's public tile usage policy.
+
+## Limitations
+
+1. **Model output is not a sensor observation.** Forecasts and archived values represent atmospheric-model output and can differ from ground conditions.
+2. **The map is interpolated.** The heat layer is generated from sparse sample points. Its smooth appearance must not be interpreted as a high-resolution measurement surface.
+3. **City comparisons are limited.** Featured cities represent values at selected coordinates, not citywide averages.
+4. **Correlation is not causation.** Associations between weather and pollution do not establish causal relationships.
+5. **No validated machine-learning claim.** Predictive accuracy should not be claimed until a model is evaluated against independent observations using a time-based holdout.
+6. **Not for health decisions.** This application is not an official warning service, medical assessment, or substitute for local public-health guidance.
+
+## Project status
+
+AirAware is a portfolio and research prototype prepared for final quality assurance and deployment testing. Live API behaviour, browser rendering, mobile layout, provider limits, and the hosted deployment should be verified before announcing a production release.
+
+## Licence
+
+The original AirAware source code in this repository is licensed under the [MIT License](LICENSE). This licence applies to the project's own code and documentation; it does **not** relicense third-party datasets, API content, map tiles, or dependencies. Those materials remain subject to their respective licences, attribution requirements, and service terms. See [ATTRIBUTION.md](ATTRIBUTION.md) before reusing or redistributing them.
