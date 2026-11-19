@@ -17,7 +17,8 @@ borderColor = "#E2E8E2"
 showWidgetBorder = true
 
 [server]
-headless = false
+headless = true
+showEmailPrompt = false
 
 [browser]
 gatherUsageStats = false
